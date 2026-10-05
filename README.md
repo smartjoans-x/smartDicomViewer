@@ -7,7 +7,7 @@ A completely free, **open-source**, and **web-based DICOM viewer** designed to v
 ## Features
 * **Web-Based & Open Source:** Runs entirely in your browser with zero installation required. 
 * **100% Free API:** Integrate into any web app, clinic portal, or PACS effortlessly with our free API. No sign-ups, subscriptions, or API keys needed.
-* **No Uploads (Privacy First):** Images are read locally in your browser memory and are *never* uploaded to any server.
+* **No Uploads (Privacy First):** Images are processed strictly within your **local browser memory** and are *never* uploaded to any external server.
 * **Advanced Tools:** MPR, 3D volume view, multi-layout (up to 3x3), window/level presets, and clinical measurements.
 * **Mobile Ready:** Touch scrolling, pinch zoom, and a phone-friendly layout. Works perfectly on Android and iOS.
 * **Format Support:** Uncompressed, JPEG baseline and lossless, JPEG-LS, JPEG 2000, and RLE.
