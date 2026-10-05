@@ -18,14 +18,14 @@ You do not need to host the API script yourself. You can serve `smartviewer.js` 
 ### 1. Include the Script
 Add the following script tag to your HTML page:
 
+```html
+<script src="https://cdn.jsdelivr.net/gh/smartjoans-x/smartDicomViewer/smartviewer.js"></script>
+```
 
-<script src="[https://cdn.jsdelivr.net/gh/smartjoans-x/smartDicomViewer/smartviewer.js](https://cdn.jsdelivr.net/gh/smartjoans-x/smartDicomViewer/smartviewer.js)"></script>
+### 2. Open Images from Your Server (Way 3)
+Call `SmartViewer.open()` from a button click. Your page reads the images from your own server and hands them to SmartViewer inside the browser. No CORS setup is required for this method.
 
-
-2. Open Images from Your Server (Way 3)
-Call SmartViewer.open() from a button click. Your page reads the images from your own server and hands them to SmartViewer inside the browser. No CORS setup is required for this method.
-
-HTML
+```html
 <button id="view-btn">View DICOM Images</button>
 
 <script>
@@ -40,15 +40,21 @@ document.getElementById('view-btn').addEventListener('click', () => {
   });
 });
 </script>
+```
 
-3. Open Local Files Chosen by the User
+### 3. Open Local Files Chosen by the User
 Allow users to select DICOM files directly from their device:
 
-HTML
+```html
 <input type="file" multiple onchange="SmartViewer.open({ title: 'My Study', files: [...this.files] })">
-CORS Configuration (For Image Links & Manifests)
+```
+
+## CORS Configuration (For Image Links & Manifests)
+
 If you are using Way 1 (Image Links) or Way 2 (Study Manifest) where SmartViewer directly fetches files from your server, your server must use HTTPS and send the following CORS header to allow access:
 
-Plaintext
-Access-Control-Allow-Origin: [https://smartjoans.space](https://smartjoans.space)
-Note: If you use Way 3 (smartviewer.js) as shown in the code examples above, no CORS setup is needed because your own page handles reading the files.
+```plaintext
+Access-Control-Allow-Origin: https://smartjoans.space
+```
+
+*Note: If you use Way 3 (`smartviewer.js`) as shown in the code examples above, no CORS setup is needed because your own page handles reading the files.*
