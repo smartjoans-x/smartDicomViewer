@@ -18,7 +18,7 @@ You do not need to host the API script yourself. You can serve `smartviewer.js` 
 ### 1. Include the Script
 Add the following script tag to your HTML page:
 
-```html
+
 <script src="[https://cdn.jsdelivr.net/gh/smartjoans-x/smartDicomViewer/smartviewer.js](https://cdn.jsdelivr.net/gh/smartjoans-x/smartDicomViewer/smartviewer.js)"></script>
 
 
