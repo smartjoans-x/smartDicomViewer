@@ -1,0 +1,2400 @@
+/*!
+ * SmartViewer core - (c) SmartJOANS. Free to USE at https://smartjoans.space/dicom/
+ * (links, API and smartviewer.js). Copying this file to run SmartViewer elsewhere is not allowed.
+ */
+(function svGuard() {
+  var hosts = window.__SV_HOSTS || [];
+  var ok = location.protocol === 'https:' && hosts.indexOf(location.hostname) !== -1;
+  if (ok) return;
+  document.title = 'SmartViewer';
+  document.body.innerHTML =
+    '<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;' +
+    'background:#0d1117;color:#e6ebf1;font:16px/1.6 system-ui,sans-serif;text-align:center">' +
+    '<div><h1 style="font-size:22px;margin:0 0 8px;color:#f2b33d">SmartViewer works only online</h1>' +
+    '<p style="margin:0 0 16px;color:#a4b0bf">This copy cannot run here. Open the free viewer at its own address.</p>' +
+    '<a href="https://smartjoans.space/dicom/" style="display:inline-block;background:#f2b33d;color:#1a1406;' +
+    'padding:10px 18px;border-radius:8px;font-weight:600;text-decoration:none">Open smartjoans.space/dicom</a></div></div>';
+  throw new Error('SmartViewer: this copy is not running on smartjoans.space');
+})();
+(() => {
+  const $ = id => document.getElementById(id);
+  // The ACTIVE viewport's cornerstone element (changes when another viewport is clicked)
+  let element = null;
+  const viewer = $('viewer');
+
+  /* ---------------- 1. Engine setup ---------------- */
+  cornerstoneWADOImageLoader.external.cornerstone = cornerstone;
+  cornerstoneWADOImageLoader.external.dicomParser = dicomParser;
+  cornerstoneTools.external.cornerstone = cornerstone;
+  cornerstoneTools.external.cornerstoneMath = cornerstoneMath;
+  if (window.Hammer) cornerstoneTools.external.Hammer = window.Hammer;
+
+  const LOADER_CDN = 'https://cdn.jsdelivr.net/npm/cornerstone-wado-image-loader@3.3.1/dist/';
+  const workerBlobUrl = URL.createObjectURL(new Blob(
+    [`importScripts('${LOADER_CDN}cornerstoneWADOImageLoaderWebWorker.min.js');`],
+    { type: 'application/javascript' }
+  ));
+  cornerstoneWADOImageLoader.webWorkerManager.initialize({
+    maxWebWorkers: Math.min(navigator.hardwareConcurrency || 4, 8),
+    startWebWorkersOnDemand: true,
+    webWorkerPath: workerBlobUrl,
+    taskConfiguration: {
+      decodeTask: {
+        loadCodecsOnStartup: true,
+        initializeCodecsOnStartup: false,
+        codecsPath: LOADER_CDN + 'cornerstoneWADOImageLoaderCodecs.min.js',
+        usePDFJS: false,
+        strict: false
+      }
+    }
+  });
+
+  // IMPORTANT: init tools BEFORE enabling the element.
+  // cornerstoneTools only hooks mouse/touch input into elements enabled after init().
+  // globalToolSyncEnabled: viewports created later (multi layout, re-opened studies)
+  // automatically get every tool and the currently selected tool.
+  cornerstoneTools.init({ showSVGCursors: true, globalToolSyncEnabled: true });
+
+  const TOOLS = {
+    Wwwc: 'WwwcTool', Zoom: 'ZoomTool', Pan: 'PanTool', Magnify: 'MagnifyTool',
+    Length: 'LengthTool', Angle: 'AngleTool', EllipticalRoi: 'EllipticalRoiTool',
+    Probe: 'ProbeTool', Eraser: 'EraserTool'
+  };
+  Object.values(TOOLS).forEach(t => cornerstoneTools.addTool(cornerstoneTools[t]));
+  let activeTool = 'Wwwc';
+  cornerstoneTools.setToolActive('Wwwc', { mouseButtonMask: 1 });
+
+  function setTool(name) {
+    Object.keys(TOOLS).forEach(t => { if (t !== name) cornerstoneTools.setToolPassive(t); });
+    // "Scroll" is our own drag handler, so no cornerstone tool owns the left button then.
+    if (TOOLS[name]) cornerstoneTools.setToolActive(name, { mouseButtonMask: 1 });
+    activeTool = name;
+    $('vpGrid').classList.toggle('scroll-mode', name === 'Scroll');
+    document.querySelectorAll('.tbtn[data-tool]').forEach(b =>
+      b.classList.toggle('active', b.dataset.tool === name));
+  }
+  document.querySelectorAll('.tbtn[data-tool]').forEach(b =>
+    b.addEventListener('click', () => setTool(b.dataset.tool)));
+
+  /* ---------------- 2. State ---------------- */
+  let seriesList = [];
+  let curSeries = -1;
+  let curIndex = 0;
+  let cineTimer = null;
+  let phiHidden = false;
+  const thumbEls = [];
+
+  /* ---------------- 3. Helpers ---------------- */
+  const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  function fmtDate(d) {
+    if (!d || d.length < 8) return d || '';
+    const y = d.slice(0, 4), m = +d.slice(4, 6), day = d.slice(6, 8);
+    return `${day}-${MONTHS[m - 1] || d.slice(4, 6)}-${y}`;
+  }
+  function fmtTime(t) {
+    if (!t || t.length < 4) return t || '';
+    return `${t.slice(0, 2)}:${t.slice(2, 4)}`;
+  }
+  function fmtName(n) {
+    if (!n) return '';
+    return n.split('=')[0].replace(/\^+/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+  function fmtSex(s) {
+    return ({ M: 'Male', F: 'Female', O: 'Other' })[(s || '').toUpperCase()] || s || '';
+  }
+  function fmtAge(m) {
+    if (m.age) {
+      const mm = m.age.match(/^0*(\d+)([DWMY])$/i);
+      if (mm) return mm[1] + mm[2].toUpperCase();
+      return m.age;
+    }
+    if (m.dob && m.dob.length >= 8 && m.studyDate && m.studyDate.length >= 8) {
+      const b = new Date(+m.dob.slice(0,4), +m.dob.slice(4,6) - 1, +m.dob.slice(6,8));
+      const s = new Date(+m.studyDate.slice(0,4), +m.studyDate.slice(4,6) - 1, +m.studyDate.slice(6,8));
+      let y = s.getFullYear() - b.getFullYear();
+      if (s.getMonth() < b.getMonth() || (s.getMonth() === b.getMonth() && s.getDate() < b.getDate())) y--;
+      if (y >= 0 && y < 130) return y + 'Y';
+    }
+    return '';
+  }
+  const mask = v => phiHidden ? '•••••' : v;
+
+  function setStatus(text, isErr = false) {
+    const s = $('status');
+    s.textContent = text;
+    s.classList.toggle('err', isErr);
+  }
+
+  /* ---------------- 4. Reading headers ---------------- */
+  function parseHeader(buffer) {
+    return dicomParser.parseDicom(new Uint8Array(buffer), { untilTag: 'x7fe00010' });
+  }
+
+  async function readDataSet(file) {
+    const sizes = [65536, 1048576];
+    for (const size of sizes) {
+      if (size >= file.size) break;
+      try { return parseHeader(await file.slice(0, size).arrayBuffer()); } catch (e) { /* try bigger */ }
+    }
+    return parseHeader(await file.arrayBuffer());
+  }
+
+  function extractMeta(ds) {
+    const s = t => { try { return (ds.string(t) || '').trim(); } catch (e) { return ''; } };
+    const fl = (t, i = 0) => { try { return ds.floatString(t, i); } catch (e) { return undefined; } };
+    const it = t => { try { return ds.intString(t); } catch (e) { return undefined; } };
+    return {
+      patientName: s('x00100010'), patientId: s('x00100020'), dob: s('x00100030'),
+      sex: s('x00100040'), age: s('x00101010'),
+      studyDate: s('x00080020') || s('x00080021'), studyTime: s('x00080030') || s('x00080031'),
+      studyDesc: s('x00081030'), accession: s('x00080050'), institution: s('x00080080'),
+      referring: fmtName(s('x00080090')), studyUid: s('x0020000d'),
+      modality: s('x00080060'), seriesUid: s('x0020000e'), seriesNumber: it('x00200011'),
+      seriesDesc: s('x0008103e'), bodyPart: s('x00180015'),
+      instanceNumber: it('x00200013'), frames: it('x00280008') || 1,
+      sliceThickness: s('x00180050'), sliceLocation: fl('x00201041'),
+      kvp: s('x00180060'), mas: s('x00181152'),
+      manufacturer: s('x00080070'), model: s('x00081090')
+    };
+  }
+
+  async function readHeader(file) {
+    const ds = await readDataSet(file);
+    if (!ds.elements.x00280010) return null;               // not an image (SR, DICOMDIR, PR…)
+    return extractMeta(ds);
+  }
+
+  /* ---------------- 5. Loading a study ---------------- */
+  const SKIP_EXT = /\.(xml|txt|htm|html|htm|exe|dll|ini|inf|jpg|jpeg|png|gif|pdf|json|db|js|css|zip|bat|lnk|ico|log)$/i;
+
+  function resetAll() {
+    stopCine();
+    closeMpr();
+    close3D();
+    releaseVolume();
+    thumbEls.forEach(el => { try { cornerstone.disable(el); } catch (e) {} });
+    thumbEls.length = 0;
+    try { cornerstone.imageCache.purgeCache(); } catch (e) {}
+    try { cornerstoneWADOImageLoader.wadouri.fileManager.purge(); } catch (e) {}
+    try { cornerstoneWADOImageLoader.wadouri.dataSetCacheManager.purge(); } catch (e) {}
+    try { cornerstoneTools.globalImageIdSpecificToolStateManager.restoreToolState({}); } catch (e) {}
+    preloadToken++;
+    $('preload').textContent = '';
+    viewports.forEach(clearViewport);
+    seriesList = [];
+    curSeries = -1;
+    curIndex = 0;
+    $('seriesList').innerHTML = '';
+    tagsCache = { file: null, ds: null };
+  }
+
+  function compareItems(a, b) {
+    const ia = a.meta.instanceNumber, ib = b.meta.instanceNumber;
+    if (ia !== undefined && ib !== undefined && ia !== ib) return ia - ib;
+    const la = a.meta.sliceLocation, lb = b.meta.sliceLocation;
+    if (la !== undefined && lb !== undefined && la !== lb) return la - lb;
+    return a.file.name.localeCompare(b.file.name, undefined, { numeric: true, sensitivity: 'base' });
+  }
+
+  async function loadFiles(fileList) {
+    const files = Array.from(fileList).filter(f =>
+      !f.name.startsWith('.') && f.size > 132 &&
+      f.name.toUpperCase() !== 'DICOMDIR' && !SKIP_EXT.test(f.name));
+
+    if (!files.length) {
+      setStatus('No DICOM files found in that selection. Choose the folder that contains the images.', true);
+      return;
+    }
+
+    resetAll();
+    $('loading').classList.add('show');
+    $('loadingText').textContent = 'Reading DICOM headers…';
+
+    const parsed = [];
+    const BATCH = 16;
+    for (let i = 0; i < files.length; i += BATCH) {
+      const chunk = files.slice(i, i + BATCH);
+      const metas = await Promise.all(chunk.map(f => readHeader(f).catch(() => null)));
+      metas.forEach((m, k) => { if (m) parsed.push({ file: chunk[k], meta: m }); });
+      const done = Math.min(i + BATCH, files.length);
+      $('loadingBar').style.width = (done / files.length * 100).toFixed(1) + '%';
+      $('loadingSub').textContent = `${done} of ${files.length} files · ${parsed.length} images`;
+    }
+
+    $('loading').classList.remove('show');
+
+    if (!parsed.length) {
+      setStatus('None of the selected files are readable DICOM images.', true);
+      return;
+    }
+
+    // Group by series
+    const map = new Map();
+    for (const p of parsed) {
+      const key = p.meta.seriesUid || `no-uid-${p.meta.modality}-${p.meta.seriesNumber ?? ''}`;
+      if (!map.has(key)) map.set(key, { uid: key, meta: p.meta, items: [] });
+      map.get(key).items.push(p);
+    }
+
+    const fm = cornerstoneWADOImageLoader.wadouri.fileManager;
+    seriesList = [...map.values()].map(s => {
+      s.items.sort(compareItems);
+      s.slices = [];
+      s.items.forEach(it => {
+        const id = fm.add(it.file);
+        if (it.meta.frames > 1) {
+          for (let f = 0; f < it.meta.frames; f++)
+            s.slices.push({ imageId: `${id}?frame=${f}`, file: it.file, meta: it.meta, frame: f });
+        } else {
+          s.slices.push({ imageId: id, file: it.file, meta: it.meta });
+        }
+      });
+      delete s.items;
+      return s;
+    });
+    seriesList.sort((a, b) => (a.meta.seriesNumber ?? 99999) - (b.meta.seriesNumber ?? 99999));
+
+    const skipped = files.length - parsed.length;
+    setStatus(`Opened ${parsed.length} images in ${seriesList.length} series` + (skipped ? ` (${skipped} non-image files skipped)` : ''));
+
+    buildSeriesPanel();
+    $('emptyState').classList.add('hidden');
+    $('sliceRange').disabled = false;
+    fillEmptyViewports(true);
+    buildThumbnails();
+  }
+
+  /* ---------------- 6. Series panel ---------------- */
+  function buildSeriesPanel() {
+    const list = $('seriesList');
+    list.innerHTML = '';
+    $('seriesCount').textContent = seriesList.length;
+    seriesList.forEach((s, i) => {
+      const card = document.createElement('button');
+      card.className = 'series-card';
+      card.innerHTML = `
+        <div class="thumb" id="thumb-${i}">
+          <span class="tmod">${esc(s.meta.modality || '')}</span>
+          <span class="tcount">${s.slices.length}</span>
+        </div>
+        <div class="series-meta">
+          <div class="sd" title="${esc(s.meta.seriesDesc)}">${esc(s.meta.seriesDesc || 'Untitled series')}</div>
+          <div class="sn">Series ${esc(s.meta.seriesNumber ?? '–')} · ${s.slices.length} image${s.slices.length > 1 ? 's' : ''}</div>
+        </div>`;
+      card.addEventListener('click', () => {
+        selectSeries(i);
+        $('seriesPanel').classList.remove('open');
+      });
+      card.draggable = true;
+      card.addEventListener('dragstart', e => {
+        e.dataTransfer.setData(SERIES_DRAG, String(i));
+        e.dataTransfer.effectAllowed = 'copy';
+      });
+      list.appendChild(card);
+    });
+  }
+
+  async function buildThumbnails() {
+    for (let i = 0; i < seriesList.length; i++) {
+      const holder = $(`thumb-${i}`);
+      if (!holder) continue;
+      const s = seriesList[i];
+      const el = document.createElement('div');
+      el.style.cssText = 'position:absolute;inset:0;';
+      holder.appendChild(el);
+      try {
+        cornerstone.enable(el);
+        thumbEls.push(el);
+        const img = await cornerstone.loadAndCacheImage(s.slices[Math.floor(s.slices.length / 2)].imageId);
+        cornerstone.displayImage(el, img);
+      } catch (e) { /* thumbnail is optional */ }
+    }
+  }
+
+  function selectSeries(i, startIndex = 0) {
+    if (i < 0 || i >= seriesList.length) return;
+    if (mpr.active) closeMpr();
+    if (vr.active) close3D();
+    stopCine();
+    curSeries = i;
+    const s = seriesList[i];
+    startIndex = Math.max(0, Math.min(s.slices.length - 1, startIndex | 0));
+    if (activeVp) { activeVp.series = i; activeVp.index = startIndex; }
+    edgeArm = null;
+    document.querySelectorAll('.series-card').forEach((c, k) => c.classList.toggle('active', k === i));
+    const active = document.querySelectorAll('.series-card')[i];
+    if (active) active.scrollIntoView({ block: 'nearest' });
+    $('sliceRange').max = s.slices.length - 1;
+    $('presetSel').value = '';
+    updatePatientBar(s.meta);
+    scrollDir = startIndex > 0 ? -1 : 1;
+    renderSlice(startIndex, false);
+    preloadSeries(i);
+  }
+
+  /* ---------------- 7. Patient bar & overlays ---------------- */
+  function updatePatientBar(m) {
+    const nameEl = $('ptName');
+    const name = fmtName(m.patientName) || 'Unnamed patient';
+    const age = fmtAge(m), sex = fmtSex(m.sex);
+    const sexAge = [age, sex].filter(Boolean).join(' / ');
+    nameEl.classList.remove('empty');
+    nameEl.innerHTML = esc(mask(name)) + (sexAge ? `<span class="sex-age">${esc(sexAge)}</span>` : '');
+    nameEl.title = phiHidden ? '' : name;
+
+    const chips = [
+      ['ID', mask(m.patientId)],
+      ['DOB', mask(fmtDate(m.dob))],
+      ['Study', fmtDate(m.studyDate) + (m.studyTime ? ' ' + fmtTime(m.studyTime) : '')],
+      ['Modality', m.modality],
+      ['Exam', m.studyDesc, 'opt'],
+      ['Acc. no', m.accession, 'opt'],
+      ['Ref. by', m.referring, 'opt'],
+      ['Centre', m.institution, 'opt']
+    ].filter(c => c[1]);
+    $('ptChips').innerHTML = chips.map(c =>
+      `<span class="chip ${c[2] || ''}">${c[0]}<b>${esc(c[1])}</b></span>`).join('');
+    document.title = phiHidden ? 'DICOM Viewer' : `${name} – DICOM Viewer`;
+  }
+
+  function updateOverlay(slice, image, vpObj = activeVp, s = seriesList[curSeries], index = curIndex) {
+    if (!vpObj || !s) return;
+    const m = slice.meta;
+    const age = fmtAge(m), sex = (m.sex || '').toUpperCase();
+    vpObj.ov.tl.innerHTML = [
+      `<div class="big">${esc(mask(fmtName(m.patientName) || 'Unnamed patient'))}</div>`,
+      `<div>ID: ${esc(mask(m.patientId || '–'))}</div>`,
+      `<div>${esc([age, sex].filter(Boolean).join(' '))}${m.dob ? ' · DOB ' + esc(mask(fmtDate(m.dob))) : ''}</div>`,
+      m.accession ? `<div>Acc: ${esc(m.accession)}</div>` : ''
+    ].join('');
+
+    vpObj.ov.tr.innerHTML = [
+      m.institution ? `<div>${esc(m.institution)}</div>` : '',
+      m.studyDesc ? `<div>${esc(m.studyDesc)}</div>` : '',
+      `<div>${esc(fmtDate(m.studyDate))} ${esc(fmtTime(m.studyTime))}</div>`,
+      `<div>${esc(m.modality || '')}${m.seriesDesc ? ' · ' + esc(m.seriesDesc) : ''}</div>`,
+      m.manufacturer ? `<div>${esc(m.manufacturer)} ${esc(m.model)}</div>` : ''
+    ].join('');
+
+    const br = [
+      `<div class="big">Im ${index + 1} / ${s.slices.length}</div>`,
+      `<div>Series ${esc(m.seriesNumber ?? '–')}${slice.frame !== undefined ? ' · Frame ' + (slice.frame + 1) : ''}</div>`,
+      `<div>${image.columns} × ${image.rows}</div>`
+    ];
+    if (m.sliceThickness) br.push(`<div>Thk ${parseFloat(m.sliceThickness).toFixed(1)} mm</div>`);
+    if (m.sliceLocation !== undefined) br.push(`<div>Loc ${m.sliceLocation.toFixed(1)} mm</div>`);
+    if (m.kvp) br.push(`<div>${esc(m.kvp)} kV${m.mas ? ' · ' + esc(m.mas) + ' mAs' : ''}</div>`);
+    vpObj.ov.br.innerHTML = br.join('');
+  }
+
+  function updateViewportInfo(vpObj, vp) {
+    if (!vp) return;
+    vpObj.ov.bl.innerHTML = [
+      `<div>W ${Math.round(vp.voi.windowWidth)} · L ${Math.round(vp.voi.windowCenter)}</div>`,
+      `<div>Zoom ${(vp.scale * 100).toFixed(0)}%${vp.rotation ? ' · Rot ' + vp.rotation + '°' : ''}</div>`,
+      vp.invert ? '<div>Inverted</div>' : ''
+    ].join('');
+  }
+
+  // Redraws the text overlays of every viewport (used by "Hide PHI")
+  function refreshAllOverlays() {
+    viewports.forEach(v => {
+      const s = seriesList[v.series];
+      if (!s) return;
+      let img = null;
+      try { img = cornerstone.getImage(v.el); } catch (e) {}
+      if (img) updateOverlay(s.slices[v.index], img, v, s, v.index);
+    });
+  }
+
+  /* ---------------- 8. Rendering ---------------- */
+  function renderSlice(index, keepViewport = true) {
+    const s = seriesList[curSeries];
+    if (!s) return;
+    index = Math.max(0, Math.min(s.slices.length - 1, index));
+    curIndex = index;
+    const vpObj = activeVp;
+    const el = element;
+    vpObj.index = index;
+    const slice = s.slices[index];
+    const token = ++vpObj.token;
+
+    $('sliceRange').value = index;
+    $('sliceText').textContent = `${index + 1} / ${s.slices.length}`;
+
+    cornerstone.loadAndCacheImage(slice.imageId).then(image => {
+      if (token !== vpObj.token) return;
+      let vp;
+      if (keepViewport) { try { vp = cornerstone.getViewport(el); } catch (e) {} }
+      cornerstone.displayImage(el, image, vp);
+      vpObj.cell.classList.add('has-image');
+      updateOverlay(slice, image, vpObj, s, index);
+      if (!cineTimer) setStatus(slice.file.name);
+      prefetch(index);
+      if ($('tagsPanel').classList.contains('open')) scheduleTags();
+    }).catch(err => {
+      if (token !== vpObj.token) return;
+      console.error('Decode error:', err);
+      setStatus(`Could not decode ${slice.file.name}. The transfer syntax may be unsupported.`, true);
+    });
+  }
+
+  let scrollDir = 1;
+  let rafId = 0;
+
+  // Prefetch mostly in the direction the user is scrolling
+  function prefetch(i) {
+    const s = seriesList[curSeries];
+    const ahead = [1, 2, 3, 4, 5, 6, 7, 8].map(n => i + n * scrollDir);
+    const behind = [1, 2].map(n => i - n * scrollDir);
+    ahead.concat(behind).forEach(k => {
+      if (k >= 0 && k < s.slices.length)
+        cornerstone.loadAndCacheImage(s.slices[k].imageId).catch(() => {});
+    });
+  }
+
+  // Moves to a slice at once (slider + numbers) and draws only the latest one per frame,
+  // so fast scrolling never queues up a backlog of renders.
+  function goToSlice(i) {
+    const s = seriesList[curSeries];
+    if (!s) return;
+    const last = s.slices.length - 1;
+    if (i > last && curIndex === last) { seriesEdge(1); return; }
+    if (i < 0 && curIndex === 0) { seriesEdge(-1); return; }
+    edgeArm = null;
+    hideEdgeHint();
+    i = Math.max(0, Math.min(last, i));
+    if (i === curIndex) return;
+    scrollDir = i > curIndex ? 1 : -1;
+    curIndex = i;
+    if (activeVp) activeVp.index = i;
+    $('sliceRange').value = i;
+    $('sliceText').textContent = `${i + 1} / ${s.slices.length}`;
+    if (!rafId) {
+      rafId = requestAnimationFrame(() => {
+        rafId = 0;
+        renderSlice(curIndex);
+      });
+    }
+  }
+
+  /* Series edge: at the last (or first) image, the first extra scroll shows a hint;
+     scrolling on (after a short pause, so one fast spin does not jump by mistake)
+     opens the next series at its first image (or the previous series at its last image). */
+  let edgeArm = null;
+  const EDGE_WAIT = 350;     // ms the user must keep going before the jump
+  const EDGE_KEEP = 2500;    // ms the hint stays armed
+
+  function seriesEdge(dir) {
+    const target = curSeries + dir;
+    if (target < 0 || target >= seriesList.length) {
+      showEdgeHint(dir > 0 ? 'Last image of the last series' : 'First image of the first series');
+      return;
+    }
+    const now = performance.now();
+    if (edgeArm && edgeArm.dir === dir && now - edgeArm.at >= EDGE_WAIT && now - edgeArm.at <= EDGE_KEEP) {
+      edgeArm = null;
+      hideEdgeHint();
+      const t = seriesList[target];
+      selectSeries(target, dir > 0 ? 0 : t.slices.length - 1);
+      setStatus(`Series ${t.meta.seriesNumber ?? target + 1}${t.meta.seriesDesc ? ' · ' + t.meta.seriesDesc : ''}`);
+      return;
+    }
+    if (!edgeArm || edgeArm.dir !== dir || now - edgeArm.at > EDGE_KEEP) {
+      edgeArm = { dir, at: now };
+      const t = seriesList[target];
+      const name = `Series ${t.meta.seriesNumber ?? target + 1}${t.meta.seriesDesc ? ' · ' + t.meta.seriesDesc : ''} (${t.slices.length})`;
+      showEdgeHint(dir > 0
+        ? `▼ End of series · keep scrolling for ${name}`
+        : `▲ Start of series · keep scrolling for ${name}`);
+    }
+  }
+
+  function showEdgeHint(text) {
+    if (!activeVp) return;
+    let el = activeVp.cell.querySelector('.vp-edge');
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'vp-edge';
+      activeVp.cell.appendChild(el);
+    }
+    el.textContent = text;
+    el.classList.add('show');
+    clearTimeout(showEdgeHint.timer);
+    showEdgeHint.timer = setTimeout(hideEdgeHint, EDGE_KEEP);
+  }
+
+  function hideEdgeHint() {
+    document.querySelectorAll('.vp-edge.show').forEach(el => el.classList.remove('show'));
+  }
+
+  // Loads the whole series into memory in the background, nearest slices first
+  let preloadToken = 0;
+  function preloadSeries(si) {
+    const token = ++preloadToken;
+    const s = seriesList[si];
+    if (!s || s.slices.length < 2) { $('preload').textContent = ''; return; }
+    const order = s.slices.map((_, k) => k).sort((a, b) => Math.abs(a - curIndex) - Math.abs(b - curIndex));
+    let next = 0, done = 0;
+    const show = () => {
+      if (token !== preloadToken) return;
+      $('preload').textContent = done < order.length ? `Loading ${done} / ${order.length}` : 'All slices ready';
+    };
+    const worker = async () => {
+      while (token === preloadToken && next < order.length) {
+        const k = order[next++];
+        try { await cornerstone.loadAndCacheImage(s.slices[k].imageId); } catch (e) {}
+        done++;
+        if (done % 5 === 0 || done === order.length) show();
+      }
+    };
+    show();
+    for (let n = 0; n < 3; n++) worker();
+  }
+
+  /* ---------------- 9. Viewport actions ---------------- */
+  function hasImage() {
+    try { return !!cornerstone.getImage(element); } catch (e) { return false; }
+  }
+  function editViewport(fn) {
+    if (!hasImage()) return;
+    const vp = cornerstone.getViewport(element);
+    fn(vp);
+    cornerstone.setViewport(element, vp);
+  }
+
+  $('btnInvert').onclick = () => {
+    if (vr.active) return;
+    if (mpr.active) { mpr.invert = !mpr.invert; mprRender(); return; }
+    editViewport(vp => { vp.invert = !vp.invert; });
+  };
+  $('btnRotate').onclick = () => editViewport(vp => { vp.rotation = ((vp.rotation || 0) + 90) % 360; });
+  $('btnFlipH').onclick = () => editViewport(vp => { vp.hflip = !vp.hflip; });
+  $('btnFlipV').onclick = () => editViewport(vp => { vp.vflip = !vp.vflip; });
+  $('btnReset').onclick = () => {
+    if (vr.active) { vrReset(); return; }
+    if (mpr.active) { mprReset(); return; }
+    if (hasImage()) { cornerstone.reset(element); $('presetSel').value = ''; }
+  };
+
+  $('presetSel').onchange = e => {
+    const v = e.target.value;
+    if (vr.active) return;
+    if (mpr.active) { mprPreset(v); return; }
+    if (!v || !hasImage()) return;
+    editViewport(vp => {
+      if (v === 'default') {
+        const img = cornerstone.getImage(element);
+        vp.voi.windowWidth = img.windowWidth;
+        vp.voi.windowCenter = img.windowCenter;
+      } else {
+        const [ww, wc] = v.split(',').map(Number);
+        vp.voi.windowWidth = ww;
+        vp.voi.windowCenter = wc;
+      }
+    });
+  };
+
+  $('btnClear').onclick = () => {
+    cornerstoneTools.globalImageIdSpecificToolStateManager.restoreToolState({});
+    if (hasImage()) cornerstone.updateImage(element);
+    setStatus('Measurements cleared');
+  };
+
+  $('btnOverlay').onclick = () => {
+    viewer.classList.toggle('no-overlay');
+    $('btnOverlay').classList.toggle('active', viewer.classList.contains('no-overlay'));
+  };
+
+  $('btnPhi').onclick = () => {
+    phiHidden = !phiHidden;
+    $('btnPhi').classList.toggle('active', phiHidden);
+    const s = seriesList[curSeries];
+    if (s) updatePatientBar(s.meta);
+    refreshAllOverlays();
+  };
+
+  $('btnSnap').onclick = () => {
+    if (vr.active) { vrSnapshot(); return; }
+    if (mpr.active) { mprSnapshot(); return; }
+    if (!hasImage()) return;
+    const canvas = element.querySelector('canvas');
+    const s = seriesList[curSeries];
+    const base = phiHidden ? 'image' : (fmtName(s.meta.patientName) || 'image').replace(/[^\w\-]+/g, '_');
+    const a = document.createElement('a');
+    a.href = canvas.toDataURL('image/png');
+    a.download = `${base}_S${s.meta.seriesNumber ?? 0}_I${curIndex + 1}.png`;
+    a.click();
+    setStatus('Image saved as PNG');
+  };
+
+  $('btnFull').onclick = () => {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen().catch(() => {});
+  };
+
+  $('menuBtn').onclick = () => $('seriesPanel').classList.toggle('open');
+
+  /* ---------------- 10. Cine ---------------- */
+  function startCine() {
+    if (mpr.active || vr.active) return;
+    const s = seriesList[curSeries];
+    if (!s || s.slices.length < 2) return;
+    stopCine();
+    const fps = +$('fps').value;
+    cineTimer = setInterval(() => renderSlice((curIndex + 1) % s.slices.length), 1000 / fps);
+    $('btnPlay').textContent = '❚❚';
+    setStatus(`Playing at ${fps} fps`);
+  }
+  function stopCine() {
+    if (cineTimer) clearInterval(cineTimer);
+    cineTimer = null;
+    $('btnPlay').textContent = '▶';
+  }
+  $('btnPlay').onclick = () => cineTimer ? stopCine() : startCine();
+  $('fps').onchange = () => { if (cineTimer) startCine(); };
+
+  /* ---------------- 11. DICOM tags panel ---------------- */
+  const TAG_NAMES = {
+    x00020010: 'Transfer Syntax', x00080016: 'SOP Class UID', x00080018: 'SOP Instance UID',
+    x00080020: 'Study Date', x00080021: 'Series Date', x00080030: 'Study Time', x00080050: 'Accession Number',
+    x00080060: 'Modality', x00080070: 'Manufacturer', x00080080: 'Institution', x00080090: 'Referring Physician',
+    x00081030: 'Study Description', x0008103e: 'Series Description', x00081090: 'Model',
+    x00100010: 'Patient Name', x00100020: 'Patient ID', x00100030: 'Birth Date', x00100040: 'Sex',
+    x00101010: 'Age', x00180015: 'Body Part', x00180050: 'Slice Thickness', x00180060: 'kVp',
+    x00181152: 'Exposure (mAs)', x0020000d: 'Study UID', x0020000e: 'Series UID',
+    x00200011: 'Series Number', x00200013: 'Instance Number', x00200032: 'Image Position',
+    x00200037: 'Image Orientation', x00201041: 'Slice Location', x00280002: 'Samples / Pixel',
+    x00280004: 'Photometric', x00280008: 'Number of Frames', x00280010: 'Rows', x00280011: 'Columns',
+    x00280030: 'Pixel Spacing', x00280100: 'Bits Allocated', x00280101: 'Bits Stored',
+    x00281050: 'Window Center', x00281051: 'Window Width', x00281052: 'Rescale Intercept',
+    x00281053: 'Rescale Slope'
+  };
+  const STRING_VRS = new Set(['AE','AS','CS','DA','DS','DT','IS','LO','LT','PN','SH','ST','TM','UI','UT','UC','UR']);
+
+  let tagsCache = { file: null, ds: null };
+  let tagsTimer = null;
+
+  function tagValue(ds, tag, el) {
+    try {
+      const vr = el.vr;
+      if (vr === 'SQ' || el.items) return `[sequence · ${(el.items || []).length} item(s)]`;
+      if (STRING_VRS.has(vr)) return ds.string(tag) ?? '';
+      if (vr === 'US') return ds.uint16(tag);
+      if (vr === 'SS') return ds.int16(tag);
+      if (vr === 'UL') return ds.uint32(tag);
+      if (vr === 'SL') return ds.int32(tag);
+      if (vr === 'FL') return ds.float(tag);
+      if (vr === 'FD') return ds.double(tag);
+      if (!vr && el.length > 0 && el.length < 256) {
+        const v = ds.string(tag);
+        if (v && /^[\x20-\x7e\s]*$/.test(v)) return v;
+      }
+      return `<${el.length} bytes>`;
+    } catch (e) { return ''; }
+  }
+
+  function scheduleTags() {
+    clearTimeout(tagsTimer);
+    tagsTimer = setTimeout(renderTags, 150);
+  }
+
+  async function renderTags() {
+    const s = seriesList[curSeries];
+    if (!s) { $('tagsBody').innerHTML = '<p style="padding:12px;color:var(--ink-dim)">Open a study to see its tags.</p>'; return; }
+    const file = s.slices[curIndex].file;
+    if (tagsCache.file !== file) {
+      try { tagsCache = { file, ds: await readDataSet(file) }; }
+      catch (e) { $('tagsBody').innerHTML = '<p style="padding:12px">Could not read tags.</p>'; return; }
+    }
+    const ds = tagsCache.ds;
+    const q = $('tagsSearch').value.trim().toLowerCase();
+    const phiTags = new Set(['x00100010', 'x00100020', 'x00100030']);
+    const rows = Object.keys(ds.elements).sort().filter(t => t !== 'x7fe00010').map(t => {
+      const el = ds.elements[t];
+      const label = `(${t.slice(1, 5)},${t.slice(5, 9)})`.toUpperCase();
+      const name = TAG_NAMES[t] || '';
+      let val = String(tagValue(ds, t, el));
+      if (phiHidden && phiTags.has(t)) val = '•••••';
+      return { label, name, val };
+    }).filter(r => !q || (r.label + r.name + r.val).toLowerCase().includes(q));
+
+    $('tagsBody').innerHTML = `<table>${rows.map(r =>
+      `<tr><td class="t">${r.label}</td><td class="n">${esc(r.name)}</td><td class="v">${esc(r.val)}</td></tr>`
+    ).join('')}</table>`;
+  }
+
+  function toggleTags(force) {
+    const p = $('tagsPanel');
+    const open = force ?? !p.classList.contains('open');
+    p.classList.toggle('open', open);
+    $('btnTags').classList.toggle('active', open);
+    if (open) renderTags();
+  }
+  $('btnTags').onclick = () => toggleTags();
+  $('tagsClose').onclick = () => toggleTags(false);
+  $('tagsSearch').oninput = () => renderTags();
+
+  /* ---------------- 12. Input: pickers, drag & drop, wheel, keys ---------------- */
+  ['folderPicker', 'filePicker'].forEach(id => {
+    $(id).addEventListener('change', e => {
+      loadFiles(e.target.files);
+      e.target.value = '';
+    });
+  });
+
+  async function walkEntry(entry) {
+    if (entry.isFile) return [await new Promise((res, rej) => entry.file(res, rej))];
+    if (entry.isDirectory) {
+      const reader = entry.createReader();
+      const out = [];
+      let batch;
+      do {
+        batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+        for (const en of batch) out.push(...await walkEntry(en));
+      } while (batch.length);
+      return out;
+    }
+    return [];
+  }
+
+  let dragDepth = 0;
+  const SERIES_DRAG = 'application/x-smartviewer-series';
+  const isSeriesDrag = e => !!(e.dataTransfer && Array.from(e.dataTransfer.types || []).includes(SERIES_DRAG));
+  viewer.addEventListener('dragenter', e => { e.preventDefault(); if (isSeriesDrag(e)) return; dragDepth++; viewer.classList.add('dragging'); });
+  viewer.addEventListener('dragover', e => e.preventDefault());
+  viewer.addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; viewer.classList.remove('dragging'); } });
+  viewer.addEventListener('drop', async e => {
+    e.preventDefault();
+    if (isSeriesDrag(e)) return;
+    dragDepth = 0;
+    viewer.classList.remove('dragging');
+    const entries = [...(e.dataTransfer.items || [])]
+      .map(i => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean);
+    let files = [];
+    if (entries.length) {
+      setStatus('Collecting files…');
+      for (const en of entries) files.push(...await walkEntry(en));
+    } else {
+      files = [...e.dataTransfer.files];
+    }
+    loadFiles(files);
+  });
+
+  /* Mouse wheel
+     - mouse: 1 slice per notch, 2-3 slices when the wheel is spun fast
+     - touchpad: smooth, follows the finger
+     - Shift: 5x, Ctrl (or touchpad pinch): zoom */
+  let wheelAcc = 0, lastWheel = 0;
+  function onWheel(e) {
+    if (!hasImage()) return;
+    e.preventDefault();
+
+    let d = e.deltaY || e.deltaX;               // Shift+wheel arrives as deltaX on Windows
+    if (e.deltaMode === 1) d *= 33;              // lines -> pixels (Firefox)
+    else if (e.deltaMode === 2) d *= element.clientHeight;
+    if (!d) return;
+
+    if (e.ctrlKey) {
+      const factor = Math.abs(d) >= 50 ? (d < 0 ? 1.12 : 1 / 1.12) : Math.exp(-d * 0.01);
+      editViewport(vp => { vp.scale = Math.min(20, Math.max(0.1, vp.scale * factor)); });
+      return;
+    }
+
+    stopCine();
+    const now = performance.now();
+    const gap = now - lastWheel;
+    lastWheel = now;
+    const mult = e.shiftKey ? 5 : 1;
+    let steps = 0;
+
+    if (Math.abs(d) >= 50) {                     // one mouse notch
+      wheelAcc = 0;
+      const accel = gap < 30 ? 3 : gap < 60 ? 2 : 1;
+      steps = Math.sign(d) * accel * mult;
+    } else {                                     // touchpad / smooth wheel
+      wheelAcc += d;
+      const unit = 30;
+      steps = Math.trunc(wheelAcc / unit);
+      wheelAcc -= steps * unit;
+      steps *= mult;
+    }
+
+    if (steps) goToSlice(curIndex + steps);
+  }
+
+  /* Drag to scroll (Scroll tool): drag down = next slices.
+     A full-height drag covers about the whole series. */
+  let drag = null;
+  function onScrollDown(e) {
+    if (activeTool !== 'Scroll' || e.button !== 0 || !hasImage()) return;
+    stopCine();
+    drag = { id: e.pointerId, y: e.clientY, acc: 0 };
+    try { element.setPointerCapture(e.pointerId); } catch (err) {}
+    e.preventDefault();
+  }
+  function onScrollMove(e) {
+    if (!drag || e.pointerId !== drag.id) return;
+    const s = seriesList[curSeries];
+    if (!s) return;
+    drag.acc += e.clientY - drag.y;
+    drag.y = e.clientY;
+    const pxPerSlice = Math.max(3, Math.min(20, element.clientHeight / s.slices.length));
+    const steps = Math.trunc(drag.acc / pxPerSlice);
+    if (steps) {
+      drag.acc -= steps * pxPerSlice;
+      goToSlice(curIndex + steps);
+    }
+  }
+  function onScrollEnd(e) {
+    if (drag && e.pointerId === drag.id) drag = null;
+  }
+
+  $('sliceRange').addEventListener('input', e => {
+    if (vr.active) return;
+    if (mpr.active) { mprSetIndex(mpr.focus, parseInt(e.target.value, 10)); return; }
+    stopCine();
+    goToSlice(parseInt(e.target.value, 10));
+  });
+
+  const KEY_TOOLS = { d: 'Scroll', w: 'Wwwc', z: 'Zoom', p: 'Pan', m: 'Magnify', l: 'Length', a: 'Angle', e: 'EllipticalRoi', b: 'Probe' };
+  document.addEventListener('keydown', e => {
+    if (e.target.matches('input[type="text"], input:not([type]), select, textarea')) return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const k = e.key.toLowerCase();
+    const s = seriesList[curSeries];
+
+    if (vr.active && vrKey(e, k)) return;
+    if (mpr.active && mprKey(e, k)) return;
+    if (k === 'x') { toggleMpr(); return; }
+    if (KEY_TOOLS[k]) { setTool(KEY_TOOLS[k]); return; }
+    if (LAYOUT_KEYS[k]) { setLayout(LAYOUT_KEYS[k]); return; }
+    switch (e.key) {
+      case 'ArrowDown': case 'PageDown':
+        if (s) { e.preventDefault(); stopCine(); goToSlice(curIndex + (e.key === 'PageDown' ? 10 : 1)); } break;
+      case 'ArrowUp': case 'PageUp':
+        if (s) { e.preventDefault(); stopCine(); goToSlice(curIndex - (e.key === 'PageUp' ? 10 : 1)); } break;
+      case 'ArrowRight': if (s) { e.preventDefault(); selectSeries(Math.min(seriesList.length - 1, curSeries + 1)); } break;
+      case 'ArrowLeft': if (s) { e.preventDefault(); selectSeries(Math.max(0, curSeries - 1)); } break;
+      case 'Home': if (s) { e.preventDefault(); stopCine(); goToSlice(0); } break;
+      case 'End': if (s) { e.preventDefault(); stopCine(); goToSlice(s.slices.length - 1); } break;
+      case ' ': if (s) { e.preventDefault(); cineTimer ? stopCine() : startCine(); } break;
+    }
+    if (k === 'r') $('btnReset').click();
+    else if (k === 'i') $('btnInvert').click();
+    else if (k === 'o') $('btnRotate').click();
+    else if (k === 'h') $('btnFlipH').click();
+    else if (k === 'v') $('btnFlipV').click();
+    else if (k === 'f') $('btnFull').click();
+    else if (k === 's') $('btnSnap').click();
+    else if (k === 't') $('btnOverlay').click();
+    else if (k === 'g') toggleTags();
+  });
+
+  /* ---------------- 13. Multi layout (viewports) ----------------
+     Each viewport keeps its own series and slice. Clicking / touching a viewport
+     makes it active: the toolbar, slider, keys, series list and patient bar then
+     work on it. Drag a series card onto a viewport to show it there.
+     Double-click a viewport to enlarge it, double-click again to go back. */
+  const viewports = [];
+  let activeVp = null;
+  const LAYOUT_KEYS = { 1: '1x1', 2: '1x2', 3: '2x1', 4: '2x2', 5: '2x3', 6: '3x3' };
+
+  function createViewport() {
+    const cell = document.createElement('div');
+    cell.className = 'vp';
+    cell.innerHTML = `
+      <div class="vp-el" oncontextmenu="return false;"></div>
+      <div class="vp-hint">Tap here, then pick a series<br>or drag a series here</div>
+      <div class="ov ov-tl"></div><div class="ov ov-tr"></div>
+      <div class="ov ov-bl"></div><div class="ov ov-br"></div>`;
+    const el = cell.querySelector('.vp-el');
+    const vpObj = {
+      cell, el, series: -1, index: 0, token: 0,
+      ov: {
+        tl: cell.querySelector('.ov-tl'), tr: cell.querySelector('.ov-tr'),
+        bl: cell.querySelector('.ov-bl'), br: cell.querySelector('.ov-br')
+      }
+    };
+
+    cornerstone.enable(el);
+    el.addEventListener('cornerstoneimagerendered', e => updateViewportInfo(vpObj, e.detail.viewport));
+
+    // Activate first (capture), then the normal tools / wheel / scroll handlers run
+    cell.addEventListener('pointerdown', () => activateViewport(vpObj), true);
+    cell.addEventListener('wheel', () => activateViewport(vpObj), { capture: true, passive: true });
+    el.addEventListener('wheel', onWheel, { passive: false });
+    el.addEventListener('pointerdown', onScrollDown);
+    el.addEventListener('pointermove', onScrollMove);
+    ['pointerup', 'pointercancel', 'lostpointercapture'].forEach(t => el.addEventListener(t, onScrollEnd));
+    cell.addEventListener('dblclick', () => toggleMaximize(vpObj));
+
+    cell.addEventListener('dragover', e => {
+      if (!isSeriesDrag(e)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      cell.classList.add('drop-target');
+    });
+    cell.addEventListener('dragleave', () => cell.classList.remove('drop-target'));
+    cell.addEventListener('drop', e => {
+      cell.classList.remove('drop-target');
+      if (!isSeriesDrag(e)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const si = parseInt(e.dataTransfer.getData(SERIES_DRAG), 10);
+      activateViewport(vpObj);
+      if (!isNaN(si)) selectSeries(si);
+    });
+
+    vpObj.ro = new ResizeObserver(() => { try { cornerstone.resize(el); } catch (e) {} });
+    vpObj.ro.observe(cell);
+    return vpObj;
+  }
+
+  function clearViewport(v) {
+    v.series = -1;
+    v.index = 0;
+    v.token++;
+    try { cornerstone.disable(v.el); } catch (e) {}
+    try { cornerstone.enable(v.el); } catch (e) {}
+    v.cell.classList.remove('has-image');
+    Object.values(v.ov).forEach(o => { o.innerHTML = ''; });
+  }
+
+  function activateViewport(v) {
+    if (!v || activeVp === v) return;
+    if (activeVp) { activeVp.series = curSeries; activeVp.index = curIndex; }
+    stopCine();
+    activeVp = v;
+    element = v.el;
+    curSeries = v.series;
+    curIndex = v.index;
+    viewports.forEach(x => x.cell.classList.toggle('active', x === v));
+
+    // Toolbar, slider, series list and patient bar follow the active viewport
+    const s = seriesList[curSeries];
+    document.querySelectorAll('.series-card').forEach((c, k) => c.classList.toggle('active', k === curSeries));
+    $('presetSel').value = '';
+    if (s) {
+      $('sliceRange').max = s.slices.length - 1;
+      $('sliceRange').value = curIndex;
+      $('sliceText').textContent = `${curIndex + 1} / ${s.slices.length}`;
+      updatePatientBar(s.meta);
+      if ($('tagsPanel').classList.contains('open')) scheduleTags();
+    } else {
+      $('sliceRange').max = 0;
+      $('sliceRange').value = 0;
+      $('sliceText').textContent = '0 / 0';
+    }
+  }
+
+  // Empty viewports get the next series: viewport 1 = series 1, viewport 2 = series 2 ...
+  function fillEmptyViewports(focusFirst) {
+    if (!seriesList.length) return;
+    const keep = activeVp;
+    for (let k = viewports.length - 1; k >= 0; k--) {
+      const v = viewports[k];
+      if (v.series < 0 && k < seriesList.length) {
+        activateViewport(v);
+        selectSeries(k);
+      }
+    }
+    activateViewport(focusFirst || !keep || !viewports.includes(keep) ? viewports[0] : keep);
+  }
+
+  function setLayout(value) {
+    const m = /^(\d)x(\d)$/.exec(value || '');
+    if (!m) return;
+    const rows = +m[1], cols = +m[2], n = rows * cols;
+    const grid = $('vpGrid');
+
+    if (activeVp) { activeVp.series = curSeries; activeVp.index = curIndex; }
+    stopCine();
+
+    while (viewports.length > n) {
+      const v = viewports.pop();
+      v.ro.disconnect();
+      try { cornerstone.disable(v.el); } catch (e) {}
+      v.cell.remove();
+      if (activeVp === v) activeVp = null;
+    }
+    while (viewports.length < n) {
+      const v = createViewport();
+      viewports.push(v);
+      grid.appendChild(v.cell);
+    }
+
+    grid.style.gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
+    grid.style.gridTemplateRows = `repeat(${rows}, minmax(0, 1fr))`;
+    grid.classList.toggle('multi', n > 1);
+    grid.classList.toggle('dense', n > 4);
+    grid.classList.remove('maximized');
+    viewports.forEach(v => v.cell.classList.remove('max'));
+    $('layoutSel').value = value;
+
+    if (!activeVp) activateViewport(viewports[0]);
+    else viewports.forEach(x => x.cell.classList.toggle('active', x === activeVp));
+    fillEmptyViewports(false);
+  }
+
+  function toggleMaximize(v) {
+    if (viewports.length < 2) return;
+    const on = !v.cell.classList.contains('max');
+    viewports.forEach(x => x.cell.classList.toggle('max', on && x === v));
+    $('vpGrid').classList.toggle('maximized', on);
+  }
+
+  $('layoutSel').addEventListener('change', e => { if (mpr.active) closeMpr(); if (vr.active) close3D(); setLayout(e.target.value); });
+  setLayout('1x1');
+
+
+  /* ---------------- 13b. MPR (multi-planar reconstruction) ----------------
+     The active series is stacked into one 3D volume (in memory, in this browser).
+     Three planes are cut from it: the original plane and the two at right angles.
+     Crosshair: tap / drag to move the point all three views share.
+     Wheel, arrow keys or the footer slider move through the selected view.
+     W/L: drag in W/L mode, or right-drag / Shift-drag in any mode.
+     Slab: thin slice or MIP (maximum intensity) over 5-40 mm.
+     Double-click a view to enlarge it. */
+  const mpr = {
+    active: false, building: false, buildToken: 0,
+    vol: null, X: 0, Y: 0, Z: 0, sx: 1, sy: 1, sz: 1,
+    cur: { x: 0, y: 0, z: 0 },
+    ww: 400, wc: 40, defWW: 400, defWC: 40, invert: false,
+    mode: 'cross', slab: 0, focus: 'a',
+    views: {}, lut: null, lutKey: '', raf: 0,
+    flipZ: true, names: {}, labels: {}, info: ''
+  };
+  const MPR_COLORS = { a: '#f2b33d', c: '#5fd39a', s: '#6ab7ff' };
+  const MPR_AXIS = { a: 'z', c: 'y', s: 'x' };   // which coordinate each view scrolls through
+
+  const vdot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const vcross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+  const OPP = { L: 'R', R: 'L', A: 'P', P: 'A', S: 'I', I: 'S' };
+
+  // DICOM patient axes: +x = Left, +y = Posterior, +z = Superior (head)
+  function dirLetter(v) {
+    const ax = [0, 1, 2].reduce((m, i) => Math.abs(v[i]) > Math.abs(v[m]) ? i : m, 0);
+    return [['R', 'L'], ['A', 'P'], ['I', 'S']][ax][v[ax] > 0 ? 1 : 0];
+  }
+  function planeName(normal) {
+    const ax = [0, 1, 2].reduce((m, i) => Math.abs(normal[i]) > Math.abs(normal[m]) ? i : m, 0);
+    return ['Sagittal', 'Coronal', 'Axial'][ax];
+  }
+
+  function toggleMpr() {
+    if (mpr.active) closeMpr(); else openMpr();
+  }
+
+  /* Shared 3D volume (used by MPR and 3D). One series is kept at a time. */
+  const vcache = { key: '', data: null };
+
+  function releaseVolume() {
+    vcache.key = '';
+    vcache.data = null;
+  }
+
+  async function getVolume(s, title) {
+    const key = (s.uid || '') + '|' + s.slices.length;
+    if (vcache.key === key && vcache.data) return vcache.data;
+    releaseVolume();
+
+    const list = s.slices.filter(sl => sl.frame === undefined);
+    if (list.length < 10) {
+      throw new Error('This needs a CT or MR series with at least 10 slices. Pick such a series first.');
+    }
+
+    $('loading').classList.add('show');
+    $('loadingText').textContent = title;
+    $('loadingBar').style.width = '0%';
+    $('loadingSub').textContent = `0 of ${list.length} slices`;
+
+    // 1. Decode every slice (most are already in memory from preloading)
+    const items = new Array(list.length);
+    let next = 0, done = 0;
+    const worker = async () => {
+      while (next < list.length) {
+        const k = next++;
+        const img = await cornerstone.loadAndCacheImage(list[k].imageId);
+        let plane = null;
+        try { plane = cornerstone.metaData.get('imagePlaneModule', list[k].imageId) || null; } catch (e) {}
+        items[k] = { img, plane, meta: list[k].meta, order: k };
+        done++;
+        if (done % 4 === 0 || done === list.length) {
+          $('loadingBar').style.width = (done / list.length * 100).toFixed(1) + '%';
+          $('loadingSub').textContent = `${done} of ${list.length} slices`;
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: 4 }, worker));
+
+    // 2. Check the slices fit together
+    const first = items[0];
+    const X = first.img.columns, Y = first.img.rows;
+    if (first.img.color) throw new Error('MPR and 3D work on grayscale CT / MR images only.');
+    if (items.some(it => it.img.columns !== X || it.img.rows !== Y)) {
+      throw new Error('The slices of this series have different sizes, so MPR / 3D is not possible.');
+    }
+
+    const p0 = first.plane || {};
+    const unit = v => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
+    const rowDir = unit(p0.rowCosines && p0.rowCosines.length === 3 ? p0.rowCosines.map(Number) : [1, 0, 0]);
+    const colDir = unit(p0.columnCosines && p0.columnCosines.length === 3 ? p0.columnCosines.map(Number) : [0, 1, 0]);
+    const normal = unit(vcross(rowDir, colDir));
+
+    // 3. Order along the slice direction
+    const hasPos = items.every(it => it.plane && Array.isArray(it.plane.imagePositionPatient) && it.plane.imagePositionPatient.length === 3);
+    const thick = parseFloat(first.meta.sliceThickness) || 1;
+    items.forEach(it => {
+      it.pos = hasPos ? vdot(it.plane.imagePositionPatient.map(Number), normal) : it.order * thick;
+    });
+    items.sort((a, b) => a.pos - b.pos);
+
+    const diffs = [];
+    for (let k = 1; k < items.length; k++) diffs.push(items[k].pos - items[k - 1].pos);
+    if (diffs.some(d => Math.abs(d) < 0.001)) {
+      throw new Error('This series has more than one image at the same position (for example several phases). MPR / 3D needs one image per position.');
+    }
+    const sortedD = diffs.slice().sort((a, b) => a - b);
+    const sz = Math.abs(sortedD[Math.floor(sortedD.length / 2)]) || thick;
+    const uneven = Math.max(...diffs) > sz * 1.6;
+
+    // 4. Memory check
+    const Z = items.length;
+    const voxels = X * Y * Z;
+    const small = window.matchMedia('(pointer: coarse)').matches || (navigator.deviceMemory && navigator.deviceMemory <= 4);
+    const limit = small ? 70e6 : 160e6;
+    if (voxels > limit) {
+      throw new Error(`This series is too large for this device (${Math.round(voxels / 1e6)} million voxels). Try a computer.`);
+    }
+
+    // 5. Fill the volume with real values (HU for CT)
+    const vol = new Int16Array(voxels);
+    const XY = X * Y;
+    for (let z = 0; z < Z; z++) {
+      const img = items[z].img;
+      const px = img.getPixelData();
+      const slope = img.slope || 1, icpt = img.intercept || 0;
+      const off = z * XY;
+      for (let i = 0; i < XY; i++) {
+        const v = px[i] * slope + icpt;
+        vol[off + i] = v > 32767 ? 32767 : v < -32768 ? -32768 : v;
+      }
+    }
+
+    const ps = first.img;
+    const data = {
+      vol, X, Y, Z, sz, uneven, rowDir, colDir, normal, first: ps,
+      sx: Number(p0.columnPixelSpacing || ps.columnPixelSpacing) || 1,
+      sy: Number(p0.rowPixelSpacing || ps.rowPixelSpacing) || 1,
+      zOf: new Map(items.map((it, z) => [it.img.imageId, z])),
+      modality: (s.meta.modality || '').toUpperCase(),
+      desc: s.meta.seriesDesc || s.meta.modality || 'Series'
+    };
+    vcache.key = key;
+    vcache.data = data;
+    return data;
+  }
+
+  async function openMpr() {
+    if (mpr.active || mpr.building) return;
+    const s = seriesList[curSeries];
+    if (!s) { setStatus('Open a study first, then press MPR.', true); return; }
+    if (vr.active) close3D(true);
+
+    stopCine();
+    mpr.building = true;
+    const token = ++mpr.buildToken;
+    $('btnMpr').classList.add('active');
+
+    try {
+      const d = await getVolume(s, 'Building 3D volume for MPR…');
+      if (token !== mpr.buildToken) return;
+
+      const { vol, X, Y, Z, sz, uneven, rowDir, colDir, normal } = d;
+      Object.assign(mpr, { vol, X, Y, Z, sx: d.sx, sy: d.sy, sz });
+
+      const nL = dirLetter(normal);
+      mpr.flipZ = nL !== 'I';                     // put the head (S) / front at the top
+      const topZ = mpr.flipZ ? nL : OPP[nL];
+      const rL = dirLetter(rowDir), cL = dirLetter(colDir);
+      mpr.names = { a: planeName(normal), c: planeName(colDir), s: planeName(rowDir) };
+      mpr.labels = {
+        a: { l: OPP[rL], r: rL, t: OPP[cL], b: cL },
+        c: { l: OPP[rL], r: rL, t: topZ, b: OPP[topZ] },
+        s: { l: OPP[cL], r: cL, t: topZ, b: OPP[topZ] }
+      };
+
+      const ps = d.first;
+      let ww = Number(Array.isArray(ps.windowWidth) ? ps.windowWidth[0] : ps.windowWidth);
+      let wc = Number(Array.isArray(ps.windowCenter) ? ps.windowCenter[0] : ps.windowCenter);
+      if (!(ww > 0) || isNaN(wc)) {
+        let mn = 32767, mx = -32768;
+        for (let i = 0; i < vol.length; i += 97) { const v = vol[i]; if (v < mn) mn = v; if (v > mx) mx = v; }
+        ww = Math.max(1, mx - mn); wc = (mx + mn) / 2;
+      }
+      // Use the current viewport's W/L if the user changed it
+      try {
+        const cv = cornerstone.getViewport(element);
+        if (cv && cv.voi && cv.voi.windowWidth > 0) { ww = cv.voi.windowWidth; wc = cv.voi.windowCenter; }
+      } catch (e) {}
+      mpr.defWW = mpr.ww = ww;
+      mpr.defWC = mpr.wc = wc;
+      mpr.invert = false;
+      mpr.lutKey = '';
+
+      // start at the slice the user was looking at
+      const curPos = d.zOf.get(s.slices[curIndex].imageId);
+      mpr.cur = { x: X >> 1, y: Y >> 1, z: curPos !== undefined ? curPos : Z >> 1 };
+
+      mpr.info = `${d.desc} · ${X}×${Y}×${Z} · ` +
+        `${mpr.sx.toFixed(2)}×${mpr.sy.toFixed(2)}×${sz.toFixed(2)} mm` + (uneven ? ' · uneven slice gaps' : '');
+      showMpr();
+      setStatus(uneven ? 'MPR ready. Note: the slice gaps are not even, reformatted views may look stretched in places.' : 'MPR ready');
+    } catch (err) {
+      if (token === mpr.buildToken) {
+        setStatus(err.message || 'MPR could not be built for this series.', true);
+        $('btnMpr').classList.remove('active');
+      }
+    } finally {
+      if (token === mpr.buildToken) {
+        mpr.building = false;
+        $('loading').classList.remove('show');
+      }
+    }
+  }
+
+  function buildMprViews() {
+    const grid = $('mprGrid');
+    if (grid.childElementCount) return;
+    ['a', 'c', 's'].forEach(id => {
+      const cell = document.createElement('div');
+      cell.className = 'mview';
+      cell.style.setProperty('--mcol', MPR_COLORS[id]);
+      cell.innerHTML = `
+        <canvas></canvas>
+        <div class="mtag"></div>
+        <div class="ov ov-tl"></div>
+        <div class="ov ov-bl"></div>
+        <div class="olab l"></div><div class="olab r"></div><div class="olab t"></div><div class="olab b"></div>`;
+      const canvas = cell.querySelector('canvas');
+      const off = document.createElement('canvas');
+      const v = {
+        id, cell, canvas, ctx: canvas.getContext('2d'),
+        off, offCtx: off.getContext('2d'), img: null, key: '', rect: null,
+        tag: cell.querySelector('.mtag'), tl: cell.querySelector('.ov-tl'), bl: cell.querySelector('.ov-bl'),
+        lab: { l: cell.querySelector('.olab.l'), r: cell.querySelector('.olab.r'), t: cell.querySelector('.olab.t'), b: cell.querySelector('.olab.b') }
+      };
+      mpr.views[id] = v;
+      attachMprEvents(v);
+      grid.appendChild(cell);
+    });
+
+    const note = document.createElement('div');
+    note.className = 'mnote';
+    note.innerHTML = `
+      <h3>MPR</h3>
+      <ul>
+        <li><b>Crosshair:</b> tap or drag in any view; the other two follow.</li>
+        <li><b>Slices:</b> mouse wheel, ↑ / ↓ keys or the slider below move through the selected view.</li>
+        <li><b>W/L:</b> W/L mode and drag, or right-drag / Shift-drag. Presets, Invert, Reset and PNG in the toolbar work here too.</li>
+        <li><b>MIP:</b> choose a slab thickness to see vessels and nodules better.</li>
+        <li><b>Enlarge:</b> double-click a view. <b>Exit:</b> Esc or "Exit MPR".</li>
+      </ul>`;
+    grid.appendChild(note);
+    new ResizeObserver(() => { if (mpr.active) mprRender(); }).observe(grid);
+  }
+
+  function showMpr() {
+    buildMprViews();
+    mpr.active = true;
+    $('mpr').classList.add('show');
+    $('btnMpr').classList.add('active');
+    $('mprInfo').textContent = mpr.info;
+    $('mprInfo').title = mpr.info;
+    $('mprGrid').classList.remove('maximized');
+    ['a', 'c', 's'].forEach(id => {
+      const v = mpr.views[id];
+      v.key = '';
+      v.cell.classList.remove('max');
+      v.tag.textContent = mpr.names[id];
+      Object.keys(v.lab).forEach(k => { v.lab[k].textContent = mpr.labels[id][k] || ''; });
+    });
+    setMprMode(mpr.mode);
+    mprFocus('a');
+    mprRender();
+  }
+
+  function closeMpr(keepVolume) {
+    mpr.buildToken++;
+    if (mpr.building) {
+      mpr.building = false;
+      $('loading').classList.remove('show');
+    }
+    $('btnMpr').classList.remove('active');
+    if (!mpr.active) return;
+    mpr.active = false;
+    mpr.vol = null;
+    if (keepVolume !== true && !vr.active) releaseVolume();
+    Object.values(mpr.views).forEach(v => { v.img = null; v.key = ''; v.off.width = v.off.height = 1; });
+    $('mpr').classList.remove('show');
+
+    // footer slider back to the normal viewer
+    const s = seriesList[curSeries];
+    $('sliceRange').max = s ? s.slices.length - 1 : 0;
+    $('sliceRange').value = s ? curIndex : 0;
+    $('sliceText').textContent = s ? `${curIndex + 1} / ${s.slices.length}` : '0 / 0';
+    setStatus('Back to the normal viewer');
+  }
+
+  function setMprMode(m) {
+    mpr.mode = m;
+    document.querySelectorAll('.mbtn').forEach(b => b.classList.toggle('active', b.dataset.mode === m));
+    $('mpr').classList.toggle('wl', m === 'wl');
+  }
+
+  function mprCount(id) { return id === 'a' ? mpr.Z : id === 'c' ? mpr.Y : mpr.X; }
+  function mprIndex(id) { return mpr.cur[MPR_AXIS[id]]; }
+  function mprSpacing(id) { return id === 'a' ? mpr.sz : id === 'c' ? mpr.sy : mpr.sx; }
+
+  function mprFocus(id) {
+    mpr.focus = id;
+    Object.values(mpr.views).forEach(v => v.cell.classList.toggle('focus', v.id === id));
+    syncMprSlider();
+  }
+
+  function syncMprSlider() {
+    const n = mprCount(mpr.focus), i = mprIndex(mpr.focus);
+    $('sliceRange').max = n - 1;
+    $('sliceRange').value = i;
+    $('sliceText').textContent = `${i + 1} / ${n}`;
+  }
+
+  function mprSetIndex(id, i) {
+    const n = mprCount(id);
+    mpr.cur[MPR_AXIS[id]] = Math.max(0, Math.min(n - 1, i));
+    if (id === mpr.focus) syncMprSlider();
+    mprRender();
+  }
+
+  function mprPreset(v) {
+    if (!v) return;
+    if (v === 'default') { mpr.ww = mpr.defWW; mpr.wc = mpr.defWC; }
+    else { const [ww, wc] = v.split(',').map(Number); mpr.ww = ww; mpr.wc = wc; }
+    mprRender();
+  }
+
+  function mprReset() {
+    mpr.ww = mpr.defWW; mpr.wc = mpr.defWC; mpr.invert = false;
+    mpr.cur = { x: mpr.X >> 1, y: mpr.Y >> 1, z: mpr.Z >> 1 };
+    $('mprGrid').classList.remove('maximized');
+    Object.values(mpr.views).forEach(v => v.cell.classList.remove('max'));
+    $('presetSel').value = '';
+    syncMprSlider();
+    mprRender();
+  }
+
+  function mprSnapshot() {
+    const v = mpr.views[mpr.focus];
+    if (!v) return;
+    const a = document.createElement('a');
+    a.href = v.canvas.toDataURL('image/png');
+    a.download = `mpr_${mpr.names[mpr.focus].toLowerCase()}_${mprIndex(mpr.focus) + 1}.png`;
+    a.click();
+    setStatus('MPR view saved as PNG');
+  }
+
+  function mprKey(e, k) {
+    const step = d => { e.preventDefault(); mprSetIndex(mpr.focus, mprIndex(mpr.focus) + d); return true; };
+    switch (e.key) {
+      case 'Escape': e.preventDefault(); closeMpr(); return true;
+      case 'ArrowUp': case 'ArrowLeft': return step(-1);
+      case 'ArrowDown': case 'ArrowRight': return step(1);
+      case 'PageUp': return step(-10);
+      case 'PageDown': return step(10);
+      case 'Home': return step(-1e6);
+      case 'End': return step(1e6);
+      case ' ': e.preventDefault(); return true;
+    }
+    if (k === 'x') { closeMpr(); return true; }
+    if (k === 'w') { setMprMode('wl'); return true; }
+    if (k === 'c') { setMprMode('cross'); return true; }
+    if (LAYOUT_KEYS[k] || KEY_TOOLS[k]) return true;   // not used in MPR
+    return false;                                     // r, i, s, f, g, t: normal handlers (MPR aware)
+  }
+
+  // ----- drawing -----
+  function mprLut() {
+    const key = `${mpr.ww}|${mpr.wc}|${mpr.invert}`;
+    if (key === mpr.lutKey) return;
+    const lut = mpr.lut || (mpr.lut = new Uint8ClampedArray(65536));
+    const ww = Math.max(1, mpr.ww), lo = mpr.wc - ww / 2;
+    for (let i = 0; i < 65536; i++) {
+      let g = ((i - 32768) - lo) / ww * 255;
+      g = g < 0 ? 0 : g > 255 ? 255 : g;
+      lut[i] = mpr.invert ? 255 - g : g;
+    }
+    mpr.lutKey = key;
+  }
+
+  function cutPlane(v) {
+    const { X, Y, Z, vol, lut, cur } = mpr;
+    const XY = X * Y;
+    const id = v.id;
+    const W = id === 's' ? Y : X;
+    const H = id === 'a' ? Y : Z;
+    const half = mpr.slab > 0 ? Math.round(mpr.slab / 2 / mprSpacing(id)) : 0;
+    const key = `${mprIndex(id)}|${mpr.lutKey}|${half}`;
+    if (v.img && v.key === key) return;
+    v.key = key;
+
+    if (!v.img || v.img.width !== W || v.img.height !== H) {
+      v.off.width = W; v.off.height = H;
+      v.img = v.offCtx.createImageData(W, H);
+    }
+    const d = v.img.data;
+    const n = mprCount(id), c = mprIndex(id);
+    const k0 = Math.max(0, c - half), k1 = Math.min(n - 1, c + half);
+    let p = 0;
+
+    for (let r = 0; r < H; r++) {
+      for (let u = 0; u < W; u++) {
+        let m = -32768;
+        if (id === 'a') {
+          const base = r * X + u;
+          for (let k = k0; k <= k1; k++) { const val = vol[k * XY + base]; if (val > m) m = val; }
+        } else if (id === 'c') {
+          const base = r * XY + u;
+          for (let k = k0; k <= k1; k++) { const val = vol[base + k * X]; if (val > m) m = val; }
+        } else {
+          const base = r * XY + u * X;
+          for (let k = k0; k <= k1; k++) { const val = vol[base + k]; if (val > m) m = val; }
+        }
+        const g = lut[m + 32768];
+        d[p] = g; d[p + 1] = g; d[p + 2] = g; d[p + 3] = 255;
+        p += 4;
+      }
+    }
+    v.offCtx.putImageData(v.img, 0, 0);
+  }
+
+  function drawView(v) {
+    const id = v.id;
+    const dpr = window.devicePixelRatio || 1;
+    const cw = Math.max(1, Math.round(v.cell.clientWidth * dpr));
+    const ch = Math.max(1, Math.round(v.cell.clientHeight * dpr));
+    if (v.canvas.width !== cw || v.canvas.height !== ch) { v.canvas.width = cw; v.canvas.height = ch; }
+
+    const ctx = v.ctx;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, cw, ch);
+
+    const W = v.off.width, H = v.off.height;
+    const pw = id === 's' ? mpr.sy : mpr.sx;
+    const ph = id === 'a' ? mpr.sy : mpr.sz;
+    const scale = Math.min(cw / (W * pw), ch / (H * ph));
+    const dw = W * pw * scale, dh = H * ph * scale;
+    const dx = (cw - dw) / 2, dy = (ch - dh) / 2;
+    const flip = id !== 'a' && mpr.flipZ;
+    v.rect = { dx, dy, dw, dh, W, H, flip, dpr };
+
+    ctx.imageSmoothingEnabled = true;
+    if (flip) {
+      ctx.save();
+      ctx.translate(0, dy * 2 + dh);
+      ctx.scale(1, -1);
+      ctx.drawImage(v.off, dx, dy, dw, dh);
+      ctx.restore();
+    } else {
+      ctx.drawImage(v.off, dx, dy, dw, dh);
+    }
+
+    // crosshair: vertical + horizontal line in the colours of the other planes
+    const cur = mpr.cur;
+    const lines = id === 'a' ? [cur.x, cur.y, 's', 'c'] : id === 'c' ? [cur.x, cur.z, 's', 'a'] : [cur.y, cur.z, 'c', 'a'];
+    const row = flip ? H - 1 - lines[1] : lines[1];
+    const px = dx + (lines[0] + 0.5) / W * dw;
+    const py = dy + (row + 0.5) / H * dh;
+    const gap = 14 * dpr;
+    ctx.lineWidth = Math.max(1, dpr);
+    ctx.globalAlpha = 0.85;
+    ctx.strokeStyle = MPR_COLORS[lines[2]];
+    ctx.beginPath();
+    ctx.moveTo(px, dy); ctx.lineTo(px, py - gap);
+    ctx.moveTo(px, py + gap); ctx.lineTo(px, dy + dh);
+    ctx.stroke();
+    ctx.strokeStyle = MPR_COLORS[lines[3]];
+    ctx.beginPath();
+    ctx.moveTo(dx, py); ctx.lineTo(px - gap, py);
+    ctx.moveTo(px + gap, py); ctx.lineTo(dx + dw, py);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // text
+    const i = mprIndex(id), n = mprCount(id);
+    v.tl.innerHTML = `<div class="big" style="color:${MPR_COLORS[id]}">${esc(mpr.names[id])}</div>` +
+      `<div>Slice ${i + 1} / ${n}</div><div>${(i * mprSpacing(id)).toFixed(1)} mm</div>`;
+    v.bl.innerHTML = `<div>W ${Math.round(mpr.ww)} · L ${Math.round(mpr.wc)}</div>` +
+      (mpr.slab > 0 ? `<div>MIP ${mpr.slab} mm</div>` : '') + (mpr.invert ? '<div>Inverted</div>' : '');
+  }
+
+  function mprRender() {
+    if (!mpr.active || mpr.raf) return;
+    mpr.raf = requestAnimationFrame(() => {
+      mpr.raf = 0;
+      if (!mpr.active || !mpr.vol) return;
+      mprLut();
+      Object.values(mpr.views).forEach(v => {
+        if (v.cell.offsetParent === null) return;   // hidden while another view is enlarged
+        cutPlane(v);
+        drawView(v);
+      });
+    });
+  }
+
+  // ----- mouse / touch -----
+  function mprPoint(v, e) {
+    const r = v.cell.getBoundingClientRect();
+    const R = v.rect;
+    if (!R) return null;
+    const px = (e.clientX - r.left) * R.dpr, py = (e.clientY - r.top) * R.dpr;
+    let u = Math.floor((px - R.dx) / R.dw * R.W);
+    let w = Math.floor((py - R.dy) / R.dh * R.H);
+    if (R.flip) w = R.H - 1 - w;
+    return { u: Math.max(0, Math.min(R.W - 1, u)), w: Math.max(0, Math.min(R.H - 1, w)) };
+  }
+
+  function mprMoveCross(v, e) {
+    const pt = mprPoint(v, e);
+    if (!pt) return;
+    if (v.id === 'a') { mpr.cur.x = pt.u; mpr.cur.y = pt.w; }
+    else if (v.id === 'c') { mpr.cur.x = pt.u; mpr.cur.z = pt.w; }
+    else { mpr.cur.y = pt.u; mpr.cur.z = pt.w; }
+    syncMprSlider();
+    mprRender();
+  }
+
+  function attachMprEvents(v) {
+    let drag = null, wheelAcc = 0;
+
+    v.cell.addEventListener('contextmenu', e => e.preventDefault());
+
+    v.cell.addEventListener('pointerdown', e => {
+      if (!mpr.active) return;
+      e.preventDefault();
+      mprFocus(v.id);
+      const wl = mpr.mode === 'wl' || e.button === 2 || e.shiftKey;
+      drag = { id: e.pointerId, wl, x: e.clientX, y: e.clientY };
+      try { v.cell.setPointerCapture(e.pointerId); } catch (err) {}
+      if (!wl) mprMoveCross(v, e);
+    });
+
+    v.cell.addEventListener('pointermove', e => {
+      if (!drag || e.pointerId !== drag.id) return;
+      if (drag.wl) {
+        const k = Math.max(1, mpr.ww / 250);
+        mpr.ww = Math.max(1, mpr.ww + (e.clientX - drag.x) * k);
+        mpr.wc = mpr.wc + (e.clientY - drag.y) * k;
+        drag.x = e.clientX;
+        drag.y = e.clientY;
+        $('presetSel').value = '';
+        mprRender();
+      } else {
+        mprMoveCross(v, e);
+      }
+    });
+
+    ['pointerup', 'pointercancel', 'lostpointercapture'].forEach(t =>
+      v.cell.addEventListener(t, e => { if (drag && e.pointerId === drag.id) drag = null; }));
+
+    v.cell.addEventListener('wheel', e => {
+      if (!mpr.active) return;
+      e.preventDefault();
+      mprFocus(v.id);
+      let d = e.deltaY || e.deltaX;
+      if (e.deltaMode === 1) d *= 33;
+      if (!d) return;
+      const mult = e.shiftKey ? 5 : 1;
+      let steps;
+      if (Math.abs(d) >= 50) {
+        wheelAcc = 0;
+        steps = Math.sign(d) * mult;
+      } else {
+        wheelAcc += d;
+        steps = Math.trunc(wheelAcc / 30);
+        wheelAcc -= steps * 30;
+        steps *= mult;
+      }
+      if (steps) mprSetIndex(v.id, mprIndex(v.id) + steps);
+    }, { passive: false });
+
+    v.cell.addEventListener('dblclick', () => {
+      const on = !v.cell.classList.contains('max');
+      Object.values(mpr.views).forEach(x => x.cell.classList.toggle('max', on && x === v));
+      $('mprGrid').classList.toggle('maximized', on);
+      Object.values(mpr.views).forEach(x => { x.key = ''; });
+      mprRender();
+    });
+  }
+
+  $('btnMpr').addEventListener('click', toggleMpr);
+  $('mprExit').addEventListener('click', () => closeMpr());
+  document.querySelectorAll('.mbtn').forEach(b => b.addEventListener('click', () => setMprMode(b.dataset.mode)));
+  $('mprSlab').addEventListener('change', e => { mpr.slab = +e.target.value || 0; mprRender(); });
+
+  /* ---------------- 13c. 3D volume rendering (WebGL2, in this browser) ----------------
+     The series volume (same as MPR) is sent to the graphics card as a 3D texture and
+     drawn with ray casting. Presets colour bone, skin, vessels, lung or show a MIP.
+     Drag = rotate, wheel / pinch = zoom, double-click = reset, A P L R S I = views.
+     Nothing leaves the device. */
+  const vr = {
+    active: false, building: false, token: 0,
+    gl: null, prog: null, vao: null, tex: null, tfTex: null, u: {},
+    d: null, X: 0, Y: 0, Z: 0, sx: 1, sy: 1, sz: 1, ds: 1,
+    hmin: -1024, hmax: 3071, isCT: true,
+    R: null, zoom: 1, preset: 'bone', shade: true, shift: 0, opacity: 1, clip: 0,
+    raf: 0, fast: false, idle: 0, pointers: new Map(), pinch: 0, lost: false
+  };
+
+  // Transfer-function presets: [value, r, g, b, alpha]. 'hu' = CT Hounsfield, 'frac' = 0..1 of the MR range
+  const VR_PRESETS = {
+    bone:    { label: 'Bone', unit: 'hu', pts: [[120, .75, .55, .40, 0], [220, .90, .78, .62, .30], [500, 1, .94, .85, .70], [1500, 1, 1, 1, .90]] },
+    skin:    { label: 'Skin', unit: 'hu', pts: [[-600, .85, .55, .45, 0], [-350, .95, .70, .58, .35], [100, 1, .82, .72, .60], [400, 1, .95, .90, .80]] },
+    soft:    { label: 'Soft tissue', unit: 'hu', pts: [[-120, .55, .15, .12, 0], [20, .80, .32, .26, .06], [120, .95, .65, .52, .18], [300, 1, .92, .85, .55], [1500, 1, 1, 1, .85]] },
+    vessels: { label: 'Vessels (contrast CT)', unit: 'hu', pts: [[110, .55, .05, .05, 0], [180, .90, .18, .14, .25], [350, 1, .68, .52, .55], [700, 1, .95, .9, .85]] },
+    lung:    { label: 'Lung / airway', unit: 'hu', pts: [[-1000, .3, .5, .8, 0], [-900, .45, .62, .9, .02], [-650, .75, .82, 1, .06], [-450, .75, .82, 1, 0], [250, .9, .85, .75, 0], [450, 1, .95, .9, .35]] },
+    surface: { label: 'Surface', unit: 'frac', pts: [[.18, .80, .62, .50, 0], [.30, .92, .78, .66, .35], [.60, 1, .94, .86, .75], [1, 1, 1, 1, .9]] },
+    mrsoft:  { label: 'Soft', unit: 'frac', pts: [[.08, .5, .2, .15, 0], [.25, .85, .45, .35, .08], [.55, 1, .85, .75, .35], [1, 1, 1, 1, .7]] },
+    mip:     { label: 'MIP (brightest)', unit: 'mip', pts: [] }
+  };
+
+  const VR_VIEWS = {
+    A: [[1, 0, 0], [0, 0, 1], [0, -1, 0]],
+    P: [[-1, 0, 0], [0, 0, 1], [0, 1, 0]],
+    L: [[0, 1, 0], [0, 0, 1], [1, 0, 0]],
+    R: [[0, -1, 0], [0, 0, 1], [-1, 0, 0]],
+    S: [[-1, 0, 0], [0, -1, 0], [0, 0, 1]],
+    I: [[1, 0, 0], [0, -1, 0], [0, 0, -1]]
+  };
+
+  const m3mul = (a, b) => a.map(r => [0, 1, 2].map(j => r[0] * b[0][j] + r[1] * b[1][j] + r[2] * b[2][j]));
+  const m3T = a => [0, 1, 2].map(i => [a[0][i], a[1][i], a[2][i]]);
+  function m3orth(m) {
+    const n = v => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return v.map(x => x / l); };
+    const a = n(m[0]);
+    let b = m[1].map((x, i) => x - vdot(m[1], a) * a[i]);
+    b = n(b);
+    return [a, b, vcross(a, b)];
+  }
+  const rotX = t => [[1, 0, 0], [0, Math.cos(t), -Math.sin(t)], [0, Math.sin(t), Math.cos(t)]];
+  const rotY = t => [[Math.cos(t), 0, Math.sin(t)], [0, 1, 0], [-Math.sin(t), 0, Math.cos(t)]];
+
+  const VR_VS = `#version 300 es
+  in vec2 aPos; out vec2 vUv;
+  void main() { vUv = aPos; gl_Position = vec4(aPos, 0.0, 1.0); }`;
+
+  const VR_FS = `#version 300 es
+  precision highp float;
+  precision highp sampler3D;
+  in vec2 vUv; out vec4 outColor;
+  uniform sampler3D uVol;
+  uniform sampler2D uTf;
+  uniform mat3 uA;          // camera mm -> texture
+  uniform vec2 uHalf;       // half view size in mm
+  uniform float uDepth;
+  uniform float uStep;      // mm per step
+  uniform int uSteps;
+  uniform int uMode;        // 0 = colour volume, 1 = MIP
+  uniform float uClip;
+  uniform int uShade;
+  uniform vec3 uTexel;      // one voxel in texture units
+  uniform vec3 uGradScale;  // 1 / (2 * spacing)
+  uniform vec3 uLight;      // view direction in volume axes
+  uniform vec2 uMipWin;
+  uniform float uAlphaRef;
+
+  vec2 boxHit(vec3 ro, vec3 rd) {
+    vec3 inv = 1.0 / rd;
+    vec3 t0 = (vec3(0.0) - ro) * inv;
+    vec3 t1 = (vec3(1.0) - ro) * inv;
+    vec3 tmin = min(t0, t1), tmax = max(t0, t1);
+    return vec2(max(max(tmin.x, tmin.y), tmin.z), min(min(tmax.x, tmax.y), tmax.z));
+  }
+
+  void main() {
+    vec3 ro = uA * vec3(vUv * uHalf, uDepth) + 0.5;
+    vec3 rd = uA * vec3(0.0, 0.0, -1.0);
+    vec2 th = boxHit(ro, rd);
+    if (th.x >= th.y) { outColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+    float t0 = max(th.x, 0.0), t1 = th.y;
+    t0 += uClip * (t1 - t0);
+    float t = t0;
+
+    if (uMode == 1) {
+      float m = 0.0;
+      for (int i = 0; i < 4096; i++) {
+        if (t > t1 || i >= uSteps) break;
+        m = max(m, texture(uVol, ro + rd * t).r);
+        t += uStep;
+      }
+      float g = clamp((m - uMipWin.x) / max(uMipWin.y - uMipWin.x, 1e-4), 0.0, 1.0);
+      outColor = vec4(vec3(g), 1.0);
+      return;
+    }
+
+    vec4 acc = vec4(0.0);
+    for (int i = 0; i < 4096; i++) {
+      if (t > t1 || i >= uSteps || acc.a > 0.97) break;
+      vec3 p = ro + rd * t;
+      float s = texture(uVol, p).r;
+      vec4 c = texture(uTf, vec2(s, 0.5));
+      if (c.a > 0.002) {
+        float a = 1.0 - pow(1.0 - min(c.a, 0.995), uStep / uAlphaRef);
+        vec3 col = c.rgb;
+        if (uShade == 1) {
+          vec3 g = vec3(
+            texture(uVol, p + vec3(uTexel.x, 0.0, 0.0)).r - texture(uVol, p - vec3(uTexel.x, 0.0, 0.0)).r,
+            texture(uVol, p + vec3(0.0, uTexel.y, 0.0)).r - texture(uVol, p - vec3(0.0, uTexel.y, 0.0)).r,
+            texture(uVol, p + vec3(0.0, 0.0, uTexel.z)).r - texture(uVol, p - vec3(0.0, 0.0, uTexel.z)).r
+          ) * uGradScale;
+          float glen = length(g);
+          if (glen > 1e-5) {
+            vec3 n = -g / glen;
+            float d = abs(dot(n, uLight));
+            float spec = pow(d, 28.0);
+            col = col * (0.28 + 0.78 * d) + vec3(0.22) * spec;
+          }
+        }
+        acc.rgb += (1.0 - acc.a) * a * col;
+        acc.a += (1.0 - acc.a) * a;
+      }
+      t += uStep;
+    }
+    outColor = vec4(acc.rgb, 1.0);
+  }`;
+
+  function initVrGl() {
+    if (vr.gl) return true;
+    const canvas = $('vrCanvas');
+    const gl = canvas.getContext('webgl2', { preserveDrawingBuffer: true, antialias: false, alpha: false });
+    if (!gl) return false;
+
+    const sh = (type, src) => {
+      const o = gl.createShader(type);
+      gl.shaderSource(o, src);
+      gl.compileShader(o);
+      if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw new Error('3D shader error: ' + gl.getShaderInfoLog(o));
+      return o;
+    };
+    const prog = gl.createProgram();
+    gl.attachShader(prog, sh(gl.VERTEX_SHADER, VR_VS));
+    gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, VR_FS));
+    gl.bindAttribLocation(prog, 0, 'aPos');
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error('3D program error: ' + gl.getProgramInfoLog(prog));
+
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+    ['uVol', 'uTf', 'uA', 'uHalf', 'uDepth', 'uStep', 'uSteps', 'uMode', 'uClip', 'uShade',
+     'uTexel', 'uGradScale', 'uLight', 'uMipWin', 'uAlphaRef'].forEach(n => { vr.u[n] = gl.getUniformLocation(prog, n); });
+
+    canvas.addEventListener('webglcontextlost', e => {
+      e.preventDefault();
+      vr.lost = true;
+      setStatus('The graphics card stopped the 3D view (not enough memory). Close 3D and try a smaller series.', true);
+    });
+
+    Object.assign(vr, { gl, prog, vao });
+    return true;
+  }
+
+  function vrBuildTf() {
+    const gl = vr.gl;
+    const p = VR_PRESETS[vr.preset];
+    const data = new Uint8Array(256 * 4);
+    if (p.unit !== 'mip') {
+      const shift = p.unit === 'hu' ? vr.shift : vr.shift / 1000;
+      const pts = p.pts.map(q => [q[0] + shift, q[1], q[2], q[3], q[4]]);
+      for (let i = 0; i < 256; i++) {
+        const f = i / 255;
+        const v = p.unit === 'hu' ? vr.hmin + f * (vr.hmax - vr.hmin) : f;
+        let c = [0, 0, 0, 0];
+        if (v >= pts[pts.length - 1][0]) c = pts[pts.length - 1].slice(1);
+        else if (v > pts[0][0]) {
+          for (let k = 1; k < pts.length; k++) {
+            if (v <= pts[k][0]) {
+              const a = pts[k - 1], b = pts[k], w = (v - a[0]) / Math.max(1e-6, b[0] - a[0]);
+              c = [1, 2, 3, 4].map(j => a[j] + (b[j] - a[j]) * w);
+              break;
+            }
+          }
+        }
+        data[i * 4] = c[0] * 255;
+        data[i * 4 + 1] = c[1] * 255;
+        data[i * 4 + 2] = c[2] * 255;
+        data[i * 4 + 3] = Math.min(1, c[3] * vr.opacity) * 255;
+      }
+    }
+    if (!vr.tfTex) vr.tfTex = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, vr.tfTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 256, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+
+  function vrUploadVolume(d) {
+    const gl = vr.gl;
+    const small = window.matchMedia('(pointer: coarse)').matches;
+    const maxTex = gl.getParameter(gl.MAX_3D_TEXTURE_SIZE) || 256;
+    const cap = Math.min(maxTex, small ? 256 : 512);
+    let ds = 1;
+    while (Math.ceil(d.X / ds) > cap || Math.ceil(d.Y / ds) > cap) ds++;
+    if (d.Z > maxTex) throw new Error(`This series has too many slices for 3D on this device (limit ${maxTex}).`);
+
+    // value range: CT fixed in HU, MR / others from the data
+    vr.isCT = d.modality === 'CT';
+    if (vr.isCT) {
+      vr.hmin = -1024; vr.hmax = 2047;
+    } else {
+      const sample = [];
+      for (let i = 0; i < d.vol.length; i += 53) sample.push(d.vol[i]);
+      sample.sort((a, b) => a - b);
+      vr.hmin = sample[Math.floor(sample.length * 0.01)];
+      vr.hmax = Math.max(vr.hmin + 1, sample[Math.floor(sample.length * 0.995)]);
+    }
+
+    const X2 = Math.floor(d.X / ds), Y2 = Math.floor(d.Y / ds), Z = d.Z;
+    const out = new Uint8Array(X2 * Y2 * Z);
+    const scale = 255 / (vr.hmax - vr.hmin), lo = vr.hmin, XY = d.X * d.Y, n = ds * ds;
+    let o = 0;
+    for (let z = 0; z < Z; z++) {
+      const base = z * XY;
+      for (let y = 0; y < Y2; y++) {
+        for (let x = 0; x < X2; x++) {
+          let v;
+          if (ds === 1) v = d.vol[base + y * d.X + x];
+          else {
+            v = 0;
+            for (let yy = 0; yy < ds; yy++) {
+              const r = base + (y * ds + yy) * d.X + x * ds;
+              for (let xx = 0; xx < ds; xx++) v += d.vol[r + xx];
+            }
+            v /= n;
+          }
+          const g = (v - lo) * scale;
+          out[o++] = g < 0 ? 0 : g > 255 ? 255 : g;
+        }
+      }
+    }
+
+    if (vr.tex) gl.deleteTexture(vr.tex);
+    vr.tex = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_3D, vr.tex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, X2, Y2, Z, 0, gl.RED, gl.UNSIGNED_BYTE, out);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    ['TEXTURE_WRAP_S', 'TEXTURE_WRAP_T', 'TEXTURE_WRAP_R'].forEach(w => gl.texParameteri(gl.TEXTURE_3D, gl[w], gl.CLAMP_TO_EDGE));
+
+    Object.assign(vr, { d, ds, X: X2, Y: Y2, Z, sx: d.sx * ds, sy: d.sy * ds, sz: d.sz, lost: false });
+  }
+
+  function vrPresetOptions() {
+    const keys = vr.isCT ? ['bone', 'skin', 'soft', 'vessels', 'lung', 'mip'] : ['surface', 'mrsoft', 'mip'];
+    const sel = $('vrPreset');
+    sel.innerHTML = keys.map(k => `<option value="${k}">${VR_PRESETS[k].label}</option>`).join('');
+    if (!keys.includes(vr.preset)) vr.preset = keys[0];
+    sel.value = vr.preset;
+    $('vrShift').min = vr.isCT ? -400 : -300;
+    $('vrShift').max = vr.isCT ? 400 : 300;
+  }
+
+  async function open3D() {
+    if (vr.active || vr.building) return;
+    const s = seriesList[curSeries];
+    if (!s) { setStatus('Open a study first, then press 3D.', true); return; }
+    if (mpr.active) closeMpr(true);
+
+    stopCine();
+    vr.building = true;
+    const token = ++vr.token;
+    $('btnVr').classList.add('active');
+
+    try {
+      try {
+        if (!initVrGl()) throw new Error('3D needs WebGL 2. Update the browser, or try Chrome / Safari / Edge.');
+      } catch (e) { throw e; }
+
+      const d = await getVolume(s, 'Building 3D volume…');
+      if (token !== vr.token) return;
+      $('loadingText').textContent = 'Sending volume to the graphics card…';
+      await new Promise(r => setTimeout(r, 30));
+      vrUploadVolume(d);
+      if (token !== vr.token) return;
+
+      vr.active = true;
+      vrPresetOptions();
+      vr.shift = 0; vr.opacity = 1; vr.clip = 0;
+      $('vrShift').value = 0; $('vrOpacity').value = 100; $('vrClip').value = 0;
+      vrSetView('A');
+      vrBuildTf();
+      $('vr3d').classList.add('show');
+      $('vrInfo').textContent = `${d.desc} · ${vr.X}×${vr.Y}×${vr.Z}` + (vr.ds > 1 ? ' · reduced for this device' : '');
+      vrResize();
+      vrRender(false);
+      setStatus('3D ready · drag to rotate, wheel or pinch to zoom');
+    } catch (err) {
+      if (token === vr.token) {
+        setStatus(err.message || '3D could not be built for this series.', true);
+        $('btnVr').classList.remove('active');
+      }
+    } finally {
+      if (token === vr.token) {
+        vr.building = false;
+        $('loading').classList.remove('show');
+      }
+    }
+  }
+
+  function close3D(keepVolume) {
+    vr.token++;
+    if (vr.building) {
+      vr.building = false;
+      $('loading').classList.remove('show');
+    }
+    $('btnVr').classList.remove('active');
+    if (!vr.active) return;
+    vr.active = false;
+    $('vr3d').classList.remove('show');
+    if (vr.gl && vr.tex) { vr.gl.deleteTexture(vr.tex); vr.tex = null; }
+    vr.d = null;
+    if (keepVolume !== true && !mpr.active) releaseVolume();
+    setStatus('Back to the normal viewer');
+  }
+
+  function vrSetView(k) {
+    vr.R = VR_VIEWS[k].map(r => r.slice());
+    vr.zoom = 1;
+    vrRender(false);
+  }
+
+  function vrReset() {
+    vr.shift = 0; vr.opacity = 1; vr.clip = 0;
+    $('vrShift').value = 0; $('vrOpacity').value = 100; $('vrClip').value = 0;
+    vrBuildTf();
+    vrSetView('A');
+  }
+
+  function vrResize() {
+    const c = $('vrCanvas'), stage = $('vrStage');
+    const small = window.matchMedia('(pointer: coarse)').matches;
+    const dpr = Math.min(window.devicePixelRatio || 1, small ? 1.25 : 1.5);
+    const w = Math.max(1, Math.round(stage.clientWidth * dpr)), h = Math.max(1, Math.round(stage.clientHeight * dpr));
+    if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+  }
+
+  // fast = lower quality while the user is dragging; a sharp frame follows when they stop
+  function vrRender(fast) {
+    if (!vr.active || !vr.gl || vr.lost) return;
+    vr.fast = vr.fast || !!fast;
+    if (!fast) vr.fast = false;
+    if (vr.raf) return;
+    vr.raf = requestAnimationFrame(vrDraw);
+    clearTimeout(vr.idle);
+    if (fast) vr.idle = setTimeout(() => vrRender(false), 180);
+  }
+
+  function vrDraw() {
+    vr.raf = 0;
+    if (!vr.active || vr.lost) return;
+    const gl = vr.gl, u = vr.u, d = vr.d;
+    const c = $('vrCanvas');
+    gl.viewport(0, 0, c.width, c.height);
+    gl.useProgram(vr.prog);
+    gl.bindVertexArray(vr.vao);
+
+    const Dx = vr.X * vr.sx, Dy = vr.Y * vr.sy, Dz = vr.Z * vr.sz;
+    // patient vector -> texture delta (rows = axis / length)
+    const Binv = [d.rowDir.map(v => v / Dx), d.colDir.map(v => v / Dy), d.normal.map(v => v / Dz)];
+    vr.R = m3orth(vr.R);
+    const A = m3mul(Binv, m3T(vr.R));            // camera -> texture
+    const At = m3T(A);
+    gl.uniformMatrix3fv(u.uA, false, new Float32Array([...At[0], ...At[1], ...At[2]]));
+
+    const size = Math.hypot(Dx, Dy, Dz) * 0.62 / vr.zoom;
+    const aspect = c.width / c.height;
+    gl.uniform2f(u.uHalf, aspect >= 1 ? size * aspect : size, aspect >= 1 ? size : size / aspect);
+    gl.uniform1f(u.uDepth, Math.hypot(Dx, Dy, Dz));
+
+    const minSp = Math.min(vr.sx, vr.sy, vr.sz);
+    const step = minSp * (vr.fast ? 1.6 : 0.6);
+    gl.uniform1f(u.uStep, step);
+    gl.uniform1i(u.uSteps, Math.min(4096, Math.ceil(2 * Math.hypot(Dx, Dy, Dz) / step)));
+    gl.uniform1f(u.uAlphaRef, minSp);
+    gl.uniform1i(u.uMode, vr.preset === 'mip' ? 1 : 0);
+    gl.uniform1f(u.uClip, vr.clip);
+    gl.uniform1i(u.uShade, vr.shade ? 1 : 0);
+    gl.uniform3f(u.uTexel, 1 / vr.X, 1 / vr.Y, 1 / vr.Z);
+    gl.uniform3f(u.uGradScale, 1 / (2 * vr.sx), 1 / (2 * vr.sy), 1 / (2 * vr.sz));
+    const view = m3T(vr.R).map(r => r[2]);       // camera +Z (towards viewer) in patient space
+    gl.uniform3f(u.uLight, vdot(view, d.rowDir), vdot(view, d.colDir), vdot(view, d.normal));
+
+    // MIP window: CT soft-tissue/bone friendly, MR full range; Threshold slider moves it
+    const range = vr.hmax - vr.hmin;
+    const lo = vr.isCT ? (100 + vr.shift - vr.hmin) / range : 0.2 + vr.shift / 1000;
+    const hi = vr.isCT ? (1100 + vr.shift - vr.hmin) / range : 1.0 + vr.shift / 1000;
+    gl.uniform2f(u.uMipWin, lo, lo + (hi - lo) / Math.max(0.2, vr.opacity));
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_3D, vr.tex);
+    gl.uniform1i(u.uVol, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, vr.tfTex);
+    gl.uniform1i(u.uTf, 1);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
+  function vrSnapshot() {
+    vrDraw();
+    const a = document.createElement('a');
+    a.href = $('vrCanvas').toDataURL('image/png');
+    a.download = `3d_${vr.preset}.png`;
+    a.click();
+    setStatus('3D view saved as PNG');
+  }
+
+  function vrKey(e, k) {
+    const turn = (fn, t) => { e.preventDefault(); vr.R = m3mul(fn(t), vr.R); vrRender(false); return true; };
+    switch (e.key) {
+      case 'Escape': e.preventDefault(); close3D(); return true;
+      case 'ArrowLeft': return turn(rotY, -0.17);
+      case 'ArrowRight': return turn(rotY, 0.17);
+      case 'ArrowUp': return turn(rotX, -0.17);
+      case 'ArrowDown': return turn(rotX, 0.17);
+      case ' ': e.preventDefault(); return true;
+    }
+    if (VR_VIEWS[e.key.toUpperCase()] && e.shiftKey) { vrSetView(e.key.toUpperCase()); return true; }
+    if (k === 'r') { vrReset(); return true; }
+    if (k === 's') { vrSnapshot(); return true; }
+    if (k === 'f' || k === 'g' || k === 't') return false;
+    return true;   // other viewer keys do nothing in 3D
+  }
+
+  // ----- mouse / touch -----
+  (function attachVrEvents() {
+    const stage = $('vrStage');
+    stage.addEventListener('contextmenu', e => e.preventDefault());
+
+    stage.addEventListener('pointerdown', e => {
+      if (!vr.active) return;
+      e.preventDefault();
+      vr.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      try { stage.setPointerCapture(e.pointerId); } catch (err) {}
+      if (vr.pointers.size === 2) {
+        const [a, b] = [...vr.pointers.values()];
+        vr.pinch = Math.hypot(a.x - b.x, a.y - b.y);
+      }
+    });
+
+    stage.addEventListener('pointermove', e => {
+      const prev = vr.pointers.get(e.pointerId);
+      if (!prev) return;
+      const cur = { x: e.clientX, y: e.clientY };
+      vr.pointers.set(e.pointerId, cur);
+
+      if (vr.pointers.size >= 2) {
+        const [a, b] = [...vr.pointers.values()];
+        const dist = Math.hypot(a.x - b.x, a.y - b.y);
+        if (vr.pinch > 0) vr.zoom = Math.min(8, Math.max(0.3, vr.zoom * dist / vr.pinch));
+        vr.pinch = dist;
+        vrRender(true);
+        return;
+      }
+
+      const k = 0.008;
+      vr.R = m3mul(m3mul(rotY((cur.x - prev.x) * k), rotX((cur.y - prev.y) * k)), vr.R);
+      vrRender(true);
+    });
+
+    ['pointerup', 'pointercancel', 'lostpointercapture'].forEach(t => stage.addEventListener(t, e => {
+      vr.pointers.delete(e.pointerId);
+      if (vr.pointers.size < 2) vr.pinch = 0;
+    }));
+
+    stage.addEventListener('wheel', e => {
+      if (!vr.active) return;
+      e.preventDefault();
+      let d = e.deltaY;
+      if (e.deltaMode === 1) d *= 33;
+      vr.zoom = Math.min(8, Math.max(0.3, vr.zoom * Math.exp(-d * 0.0015)));
+      vrRender(true);
+    }, { passive: false });
+
+    stage.addEventListener('dblclick', () => vrSetView('A'));
+
+    new ResizeObserver(() => { if (vr.active) { vrResize(); vrRender(false); } }).observe(stage);
+  })();
+
+  $('btnVr').addEventListener('click', () => { if (vr.active) close3D(); else open3D(); });
+  $('vrExit').addEventListener('click', () => close3D());
+  $('vrPreset').addEventListener('change', e => { vr.preset = e.target.value; vrBuildTf(); vrRender(false); });
+  $('vrShift').addEventListener('input', e => { vr.shift = +e.target.value; vrBuildTf(); vrRender(true); });
+  $('vrOpacity').addEventListener('input', e => { vr.opacity = +e.target.value / 100; vrBuildTf(); vrRender(true); });
+  $('vrClip').addEventListener('input', e => { vr.clip = +e.target.value / 100; vrRender(true); });
+  $('vrShade').addEventListener('change', e => { vr.shade = e.target.checked; vrRender(false); });
+  document.querySelectorAll('#vrViews button').forEach(b => b.addEventListener('click', () => vrSetView(b.dataset.view)));
+
+  /* ---------------- 14. Receive images from any page (free, no permission) ----------------
+     Any website can open this viewer (frame or tab) with ?from=page&session=<id>
+     and hand it images with postMessage. Easiest way: smartviewer.js (see api.html).
+     The viewer never sends images anywhere; it only shows what it receives. */
+  const params = new URLSearchParams(location.search);
+  const FINDER_SESSION = params.get('session') || '';
+  const inbox = { active: false, files: [], count: 0, bytes: 0, totalBytes: 0, from: '' };
+
+  if (params.get('from') && FINDER_SESSION) {
+    $('emptyState').querySelector('h2').textContent = 'Waiting for images…';
+    $('emptyState').querySelector('p').textContent =
+      'Images are being sent from the page that opened this viewer. Keep that page open until this finishes.';
+  }
+
+  window.addEventListener('message', e => {
+    const d = e.data;
+    if (!d || typeof d.type !== 'string' || d.session !== FINDER_SESSION) return;
+    const reply = msg => { try { e.source.postMessage(msg, e.origin); } catch (err) {} };
+
+
+    switch (d.type) {
+      case 'smartviewer-ping':
+        reply({ type: 'smartviewer-ready', session: FINDER_SESSION });
+        break;
+
+      case 'smartviewer-begin':
+        stopCine();
+        Object.assign(inbox, { active: true, files: [], count: d.count || 0, bytes: 0, totalBytes: d.totalBytes || 0 });
+        $('loading').classList.add('show');
+        inbox.from = e.origin;
+        $('loadingText').textContent = d.label ? `Receiving ${d.label}…` : 'Receiving images…';
+        $('loadingBar').style.width = '0%';
+        $('loadingSub').textContent = `0 of ${inbox.count} files`;
+        setStatus(`Receiving images from ${e.origin}…`);
+        break;
+
+      case 'smartviewer-files':
+        if (!inbox.active || !Array.isArray(d.files)) return;
+        d.files.forEach(f => {
+          inbox.files.push(new File([f.data], f.name, { type: 'application/dicom' }));
+          inbox.bytes += f.data.byteLength;
+        });
+        $('loadingBar').style.width = (inbox.totalBytes
+          ? inbox.bytes / inbox.totalBytes * 100
+          : inbox.files.length / Math.max(1, inbox.count) * 100).toFixed(1) + '%';
+        $('loadingSub').textContent = inbox.count
+          ? `${inbox.files.length} of ${inbox.count} files`
+          : `${inbox.files.length} files`;
+        break;
+
+      case 'smartviewer-end': {
+        if (!inbox.active) return;
+        inbox.active = false;
+        const files = inbox.files;
+        inbox.files = [];
+        $('loading').classList.remove('show');
+        setStatus(`Received ${files.length} files, opening…`);
+        loadFiles(files).then(() => {
+          if (!seriesList.length) {
+            $('emptyState').querySelector('h2').textContent = 'No images could be read';
+            $('emptyState').querySelector('p').textContent =
+              `${files.length} files arrived, but none of them is a readable DICOM image.`;
+          }
+          reply({ type: 'smartviewer-loaded', session: FINDER_SESSION, count: seriesList.length });
+        });
+        break;
+      }
+
+      case 'smartviewer-cancel':
+        inbox.active = false;
+        inbox.files = [];
+        $('loading').classList.remove('show');
+        $('emptyState').classList.remove('hidden');
+        $('emptyState').querySelector('h2').textContent = d.message ? 'Images could not be sent' : 'Sending was cancelled';
+        $('emptyState').querySelector('p').textContent = String(d.message || 'The page that opened this viewer stopped sending images.').slice(0, 300);
+        setStatus(d.message ? String(d.message).slice(0, 200) : 'Sending was cancelled.', true);
+        break;
+    }
+  });
+
+  // Tell the Study Finder tab we are ready (nothing sensitive in this message).
+  // The opening page pings us with its session id; we answer "ready" to it.
+
+  /* ---------------- 15. Open a study from a link ----------------
+     Two ways (full guide: api.html next to this page):
+
+     1. Manifest (any number of images)
+          .../dicom/?manifest=<url-encoded manifest URL>[&title=<text>]
+        Manifest JSON:
+          { "title": "optional", "files": [ { "name": "IM1.dcm", "url": "https://...", "size": 524288 } ] }
+        "url" may be relative to the manifest URL.
+
+     2. Direct image links (a few images)
+          .../dicom/?url=<encoded image URL>&url=<encoded image URL>...[&title=<text>]
+
+     Images are downloaded by this page straight from the owner's server.
+     That server must send CORS (Access-Control-Allow-Origin) and use https. */
+  const MANIFEST = params.get('manifest');
+  const DIRECT_URLS = params.getAll('url').filter(Boolean);
+  const LINK_TITLE = (params.get('title') || '').slice(0, 120);
+
+  function showLinkMessage(title, text) {
+    $('loading').classList.remove('show');
+    $('emptyState').classList.remove('hidden');
+    $('emptyState').querySelector('h2').textContent = title;
+    $('emptyState').querySelector('p').textContent = text;
+    setStatus(title, true);
+  }
+
+  async function fetchWithRetry(url, asJson, tries = 3) {
+    for (let n = 1; ; n++) {
+      try {
+        // same-origin: cookies go along when the viewer and the API are on one server
+        const r = await fetch(url, { credentials: 'same-origin', cache: asJson ? 'no-store' : 'default' });
+        if (asJson) {
+          const text = await r.text();
+          let j;
+          try { j = JSON.parse(text); }
+          catch (e) {
+            const err = new Error(/<html|<!doctype/i.test(text)
+              ? 'The image server answered with a web page (often a login page) instead of the study list'
+              : `The image server sent an unreadable answer (HTTP ${r.status})`);
+            err.fatal = true;
+            throw err;
+          }
+          if (!r.ok || j.status === 'error') {
+            const err = new Error(j.message || `Server error (HTTP ${r.status})`);
+            err.fatal = true;
+            throw err;
+          }
+          return j;
+        }
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return await r.arrayBuffer();
+      } catch (e) {
+        if (e.fatal || n >= tries) throw e;
+        await new Promise(res => setTimeout(res, 1200 * n));
+      }
+    }
+  }
+
+  function blockedByHttps(u) {
+    return location.protocol === 'https:' && u.protocol === 'http:';
+  }
+
+  const HTTPS_TEXT = 'This viewer is open on https but the images are on http, and browsers block that. ' +
+    'The image server must use https (or open the viewer copy on the same server as the images).';
+
+  async function downloadAndOpen(list, baseUrl, title) {
+    if (!list.length) { showLinkMessage('No images', 'The link has no image files.'); return; }
+
+    const total = list.reduce((sum, f) => sum + (f.size || 0), 0);
+    const out = new Array(list.length);
+    let next = 0, done = 0, bytes = 0, failed = null;
+
+    $('emptyState').classList.add('hidden');
+    $('loading').classList.add('show');
+    $('loadingText').textContent = title ? `Downloading ${title}…` : 'Downloading images…';
+    $('loadingBar').style.width = '0%';
+    $('loadingSub').textContent = `0 of ${list.length} images`;
+
+    const worker = async () => {
+      while (!failed && next < list.length) {
+        const k = next++;
+        const f = list[k];
+        try {
+          const u = new URL(f.url, baseUrl);
+          if (blockedByHttps(u)) { const e = new Error(HTTPS_TEXT); e.fatal = true; throw e; }
+          const buf = await fetchWithRetry(u.href, false);
+          out[k] = new File([buf], f.name || `image${k + 1}.dcm`, { type: 'application/dicom' });
+          bytes += buf.byteLength;
+        } catch (e) {
+          failed = e;
+          return;
+        }
+        done++;
+        $('loadingBar').style.width = (total ? bytes / total * 100 : done / list.length * 100).toFixed(1) + '%';
+        $('loadingSub').textContent = `${done} of ${list.length} images · ${(bytes / 1048576).toFixed(1)} MB`;
+      }
+    };
+
+    await Promise.all(Array.from({ length: Math.min(6, list.length) }, worker));
+
+    if (failed) {
+      const msg = failed.message === HTTPS_TEXT ? HTTPS_TEXT
+        : `${failed.message || 'Network error'}. If the images are on another website, that server must allow this viewer (CORS).`;
+      showLinkMessage('Download stopped', msg);
+      return;
+    }
+
+    $('loading').classList.remove('show');
+    await loadFiles(out);
+    if (!seriesList.length) {
+      showLinkMessage('No images could be read',
+        `${out.length} files were downloaded, but none of them is a readable DICOM image. Link to the original DICOM files.`);
+    }
+  }
+
+  async function loadFromManifest(raw) {
+    let mUrl;
+    try { mUrl = new URL(raw, location.href); }
+    catch (e) { showLinkMessage('Link is not valid', 'The study link is damaged. Open it again.'); return; }
+
+    if (blockedByHttps(mUrl)) { showLinkMessage('Images cannot load on this address', HTTPS_TEXT); return; }
+
+    $('emptyState').classList.add('hidden');
+    $('loading').classList.add('show');
+    $('loadingText').textContent = 'Getting study list…';
+    $('loadingBar').style.width = '0%';
+    $('loadingSub').textContent = '';
+
+    let manifest;
+    try { manifest = await fetchWithRetry(mUrl.href, true); }
+    catch (e) {
+      showLinkMessage('Study could not be opened',
+        (e.message || 'The image server did not answer.') + '. Check the network connection, or the link may have expired.');
+      return;
+    }
+
+    const list = (Array.isArray(manifest.files) ? manifest.files : [])
+      .filter(f => f && typeof f.url === 'string')
+      .map(f => ({ url: f.url, name: String(f.name || ''), size: +f.size || 0 }));
+
+    downloadAndOpen(list, mUrl, LINK_TITLE || manifest.title || '');
+  }
+
+  if (MANIFEST) {
+    loadFromManifest(MANIFEST);
+  } else if (DIRECT_URLS.length) {
+    const list = [];
+    for (const raw of DIRECT_URLS.slice(0, 500)) {
+      try {
+        const u = new URL(raw, location.href);
+        const name = decodeURIComponent(u.pathname.split('/').pop() || '') || `image${list.length + 1}.dcm`;
+        list.push({ url: u.href, name, size: 0 });
+      } catch (e) { /* skip broken link */ }
+    }
+    downloadAndOpen(list, location.href, LINK_TITLE);
+  }
+})();

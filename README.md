@@ -1,125 +1,155 @@
-<div align="center">
-  <img src="https://github.com/user-attachments/assets/741c7b1d-f99f-4e69-a340-1db927890e2d" alt="SmartViewer Banner" width="100%">
-  
-  <h1>🏥 SMARTVIEWER</h1>
-  <p><b>Open-Source Web DICOM Viewer | Local-First Privacy | Free Integration API</b></p>
-  
-  <a href="https://smartjoans.space/dicom/"><img src="https://img.shields.io/badge/Live_Demo-smartjoans.space-blue?style=for-the-badge&logo=googlechrome" alt="Live Demo"></a>
-  <a href="https://smartjoans.space/"><img src="https://img.shields.io/badge/Developer-SmartJoans-orange?style=for-the-badge&logo=codeigniter" alt="Developer"></a>
-  <img src="https://img.shields.io/badge/Privacy-Local_First-success?style=for-the-badge&logo=shield" alt="Privacy">
+<div> 
+  <div style="float: left;width: 15%;"><img src="https://raw.githubusercontent.com/cylab-tw/bluelight/master/bluelight/image/icon/black/BLLogoSmall.png" width="90px"></div>
+  <div style="float: left;width: 85%;"><h1>BlueLight Web-based DICOM Viewer (BlueLight Viewer)</h1> 
 </div>
+<p><strong>Blue Light</strong> is a browser-based medical image viewer primarily maintained by the <a href="https://cylab.dicom.tw/">Imaging Informatics Labs</a>. It is a pure single-page application (SPA), lightweight, and uses only JavaScript and HTML5 technologies to deploy it on any HTTP server easily (just put it in the HTTP server). It supports not only opening local data but also connecting to medical image archives which support <a href="https://www.dicomstandard.org/using/dicomweb/">DICOMweb</a>. It can display various image markups and annotations such as Annotation and Image Markup (AIM), DICOM-RT structure set (RTSS), DICOM Overlay, and DICOM Presentation State. It provides tools for medical image interpretation and 3D image reconstruction, e.g., Multiplanar Rreformation or Reconstruction (MPR) and Volume Rendering (VR).</p>
 
-<br>
+<a href="https://cylab-tw.github.io/bluelight/search/html/start.html"><strong>Live DEMO</strong></a>&ensp;&ensp;Short URL: https://blsearch.dicom.tw &ensp;&ensp;&ensp;
+<a href="https://cylab-tw.github.io/bluelight/bluelight/html/start.html"><strong>Online Viewer</strong></a>&ensp;&ensp;Short URL: https://bl.dicom.tw &ensp;&ensp;&ensp; 
 
-## 📋 Project Overview
-**SmartViewer** is a lightweight, browser-based DICOM viewer designed for opening, exploring, and sharing medical imaging studies seamlessly. It supports CT, MRI, X-ray, and ultrasound DICOM files directly from your computer, phone, scan CD/DVD, removable drives, or an integrated hospital system. 
+## Demo Videos
+* [Video - Basic operation](https://youtu.be/AbeiOjQNHjk)
 
-Built for secondary viewing and sharing, the viewer runs entirely in your browser. 
+### Plugin
+* [Video - Labeling tools](https://youtu.be/1WZ6VshkWpc)
+* [Video - DICOM SEG Editor](https://youtu.be/mXBJtlO8YEU)
+* [Video - 2D MPR](https://youtu.be/p-2agvZ-mSc)
+* [Video - MIP and minIP](https://youtu.be/pC70KfSqVPY)
+* Volume Rendering
+  - <a href="https://youtu.be/NfoktLofJL8"><strong> Video - Volume Rendering Scenario #1 </a>
+  - <a href="https://youtu.be/CrLJsGuIgtI"><strong> Video - Volume Rendering Scenario #2 </a> 
+* [Video - Dig](https://youtu.be/HEd9--DCp_4)
 
-🔒 **Privacy Model:** Files selected from your device are processed locally in the browser. Images are **never** uploaded to or stored on our servers.
+## Install
+* Put all files into any directory in the static directory on any HTTP server.
 
----
+## DICOMWeb Configuration
+* go to `./bluelight/data/config.json` and change the configuration of the DICOM server.
+ - **Reminder** The DICOMWeb Plugin of the DICOM server shall be installed first. 
+ 
+## About
+* BlueLight是少數能在網頁上顯示3D VR、MIP及MPR的開源DICOM瀏覽系統，它擁有平易近人的操作介面並支援RWD及Web零足跡瀏覽，可在任意大小的裝置上執行。
+* 標記顯示方面支援RTSS、Overlay、Graphic Annotation、AIM等標記，亦可於3D系統中轉換成3D標記。
+* 此專案亦支援LabelImg格式的標記繪製。
+* 3D VR顯示模式支援染色、窗度、透明、壓縮、貼皮、內插、降噪、打光、挖洞及最大密度投影，針對骨骼及肺氣管有專門的顯示模式，MPR模式則支援內插、貼皮、染色以及3D切面的顯示。
+* 通過台灣醫學資訊聯測 MI-TW 2020 - Track 4: DICOMWeb Query/Retrieve Consumer
 
-## ✨ Key Features
-- **Versatile File Support:** Open DICOM files, folders, scan CDs/DVDs, and removable drives (Drag & Drop supported).
-- **Smart Sorting:** Automatic series grouping and slice sorting utilizing DICOM metadata.
-- **Fluid Navigation:** Smooth image scrolling via mouse wheel, touch gestures, or keyboard.
-- **Advanced Adjustments:** Window/level controls with presets for brain, lung, bone, abdomen, liver, and more.
-- **Measurement Tools:** Length, angle, elliptical ROI, and pixel probe.
-- **Image Manipulation:** Zoom, pan, magnifier, rotate, flip, invert, and PNG export.
-- **Multi-Viewport Layouts:** Flexible grid views ranging from 1×1 up to 3×3.
-- **MPR Views:** Axial, coronal, and sagittal planes; MIP slabs from 5–40 mm.
-- **3D Volume Rendering:** Features presets including bone, skin, soft tissue, vessel, lung, and MIP.
-- **Cine Playback:** Adjustable from 5–30 FPS and searchable DICOM tags.
-- **Privacy Controls:** One-click hide patient details before screen sharing.
-- **Cross-Platform:** Mobile-friendly interaction with support for multiple DICOM compression types.
-- **API Ready:** Free API integration for websites, clinics, PACS, RIS, and patient portals.
+## Key Features
+### Network support
+* Load local files
+* Integration with any DICOMWeb Image Archive, including Raccoon, Orthanc, and dcm4chee server
+  - Retrieve methods: WADO-URI (as default) and WADO-RS: specify one of them in config.json
+* Integration with XNAT by plugin [xnat.js](/bluelight/scripts/plugin/xnat.js). BlueLight will query the XNAT's API to get the XML and retrieve the DICOM stored in experiments and its scans. Currently, we don't build it as an XNAT plugin. [issue: XNAT Connection](https://github.com/cylab-tw/bluelight/issues/11)
+  - Step1: copy BlueLight to the XNAT deployment folder
+  - Step2: type URL: https://{XNAT's hostname}/bluelight/search/html/start.html?experiments={XNAT expID}&scans={scanID}&format=json
 
----
+```html
+  http://{XNAT's hostname}/REST/projects/test/subjects/XNAT_S00001/experiments/XNAT_E00002/scans/1/files?format=json
+```
 
-## 📸 Interface Gallery
+### Support IODs
+* Most general image IODs (CR, DX, CT, MR, US, etc)
+* 12 Lead ECG Waveform: [Test URL](https://cylab-tw.github.io/bluelight/bluelight/html/start.html?ecgtest=true) 
+* DICOM PDF
 
-<table>
-  <tr>
-    <td align="center">
-      <img src="https://github.com/user-attachments/assets/d1a11c12-a7b1-4e3f-a27d-034ddac7949c" width="100%" alt="Landing Page">
-      <br><em>Landing page and open-study entry point</em>
-    </td>
-    <td align="center">
-      <img src="https://github.com/user-attachments/assets/7d570011-aa2b-4c2b-befb-35438141ba37" width="100%" alt="Viewer Loading">
-      <br><em>Viewer loading/opening state</em>
-    </td>
-  </tr>
-  <tr>
-    <td align="center">
-      <img src="https://github.com/user-attachments/assets/78df8a88-0f4d-4b79-b3e1-7ba3bf73626c" width="100%" alt="Image Workspace">
-      <br><em>Image viewing workspace</em>
-    </td>
-    <td align="center">
-      <img src="https://github.com/user-attachments/assets/ea4cec75-2746-41d3-8169-61c62e49138d" width="100%" alt="Measurement Tools">
-      <br><em>Measurement tools over a CT image</em>
-    </td>
-  </tr>
-  <tr>
-    <td align="center">
-      <img src="https://github.com/user-attachments/assets/5b5e3cca-b1bb-4701-b2b7-585681755a10" width="100%" alt="MPR Layout">
-      <br><em>Multi-planar reconstruction layout</em>
-    </td>
-    <td align="center">
-      <img src="https://github.com/user-attachments/assets/5c9b2de6-0a46-4df2-8c59-db2fbb275395" width="100%" alt="MPR Workspace">
-      <br><em>MPR workspace with multiple viewports</em>
-    </td>
-  </tr>
-  <tr>
-    <td colspan="2" align="center">
-      <img src="https://github.com/user-attachments/assets/d3b4896d-0509-4516-9572-f922cabd2793" width="70%" alt="3D Volume Rendering">
-      <br><em>3D volume rendering view</em>
-    </td>
-  </tr>
-</table>
+### Native features for 2D image interpretation 
+* Pan, zoom, move
+* Scroll images within a series
+* Rotation, Flip, Invert
+* Windowing
+* Cine
+* viewports:  4×4
+* Cross-Studies synchronization
+* Magnifier, etc
+* Measurements: Line and angle, text, circle, area, rule, etc.
+* hide/display markups and annotations
+* Export image: both DICOM and JPEG
 
----
+### Support the display of the kinds of markups and annotations
+* GSPS: DICOM Graphic Annotation
+* DICOM Overlay
+* DICOM-RT structure set (RTSS)
+* Annotation and Image Markup (AIM)
+* DICOM SEG (Segmentation)
+* [LabelImg](https://github.com/tzutalin/labelImg)
+* Provide the function to convert the DICOM Overalys to a DICOM SEG object.
 
-## 🚀 Getting Started
+## Plugins
+* Some advanced features are separated from the native parts of Bluelight to facilitate better performance. All supported functions are placed in folder `/scripts/plugin`. Using the [config](/bluelight/data/plugin.json) enable the selected plugins. If disableCatch is set as false, the plugin is enabled.
 
-1. Open [SmartViewer](https://smartjoans.space/dicom/) in any modern web browser.
-2. Choose a DICOM folder, individual files, or simply **drag and drop** files into the viewer.
-3. For scan CDs/DVDs or pen drives, open the drive and select the study folder (the viewer intelligently skips `DICOMDIR` and unrelated viewer-program files).
-4. On mobile devices, use the native file picker to select DICOM files.
-5. Select a series from the sidebar and start using the viewing tools, layouts, MPR, or 3D controls.
+```json
+{
+    "plugin": [
+    /*  path: the location of the plugin
+     *  name: the name of the plugin
+     *  disableCatch: enable the plugin or not.
+     *  examples show as follows:        
+     * /
+        {"path":"../scripts/plugin/oauth.js", "name": "oauth", "disableCatch": "true"},
+        {"path":"../scripts/plugin/mpr.js", "name": "MPR", "disableCatch": "true"},        
+    ]
+}
 
----
+```
+* We welcome any idea of adding new plugins from any third party, such as:
+  - Create the customized annotations encoded as an XML - see [xml_format.js](/bluelight/scripts/plugin/xml_format.js)
+  
+### Plugin: Authentication
+* OAuth2 - see [oauth.js](/bluelight/scripts/plugin/oauth.js). If OAuth2 is enabled, and then modify the [config](/bluelight/data/configOAuth.json). 
+   - **Note:** We used Keycloak to test the function of OAuth2.
 
-## ⌨️ Keyboard Shortcuts
+```json
+{
+    "enabled":false,
+    "hostname":"127.0.0.1",
+    "port":"8080",
+    "http":"http",
+    "client_id":"account",
+    "endpoints":
+    {
+        "auth":"realms/TestRealm/protocol/openid-connect/auth",
+        "validation":"realms/TestRealm/protocol/openid-connect/userinfo", 
+        "token":"realms/TestRealm/protocol/openid-connect/token" 
+    },
+    "tokenInRequest":true
+}
+```
+### Plugin : 3D Post-Processing
+* MPR (Multiplanar Reconstruction) - see [mpr.js](/bluelight/scripts/plugin/mpr.js)
+* MIP (maximum intensity projection) - implemented in MPR 
+* 3D Volume Rendering - see [vr2.js](/bluelight/scripts/plugin/vr2.js)
 
-<details>
-<summary><b>Click to reveal all shortcuts</b></summary>
-<br>
+### Plugin: Labeling tool interfaces (on experiment state)
+* [LabelImg](https://github.com/tzutalin/labelImg)
+* GSPS: DICOM Graphic Annotation - see [graphic_annotation.js](/bluelight/scripts/plugin/graphic_annotation.js)
+* DICOM-RT structure set (RTSS) - see [rtss.js](/bluelight/scripts/plugin/rtss.js)
+* DICOM SEG (Segmentation) - see [seg.js](/bluelight/scripts/plugin/seg.js)
+  - **Download as DCMTK DICOM-XML**: only launch BlueLight
+  - **Download as DIOCM SEG**: It is integrated with [Raccoon.net](https://github.com/cylab-tw/raccoon). Please put the BlightLight on Raccoon.
 
-| Key | Action | Key | Action |
-| :--- | :--- | :--- | :--- |
-| <kbd>W</kbd> | Window / Level | <kbd>↑</kbd> / <kbd>↓</kbd> | Previous / Next Image |
-| <kbd>D</kbd> | Drag to scroll | <kbd>←</kbd> / <kbd>→</kbd> | Previous / Next Series |
-| <kbd>Z</kbd> | Zoom | <kbd>PgUp</kbd> / <kbd>PgDn</kbd>| Move by 10 images |
-| <kbd>P</kbd> | Pan | <kbd>Space</kbd> | Play / Pause Cine |
-| <kbd>M</kbd> | Magnifier | <kbd>1</kbd>–<kbd>6</kbd> | Switch Layouts |
-| <kbd>L</kbd> | Length Measurement | <kbd>X</kbd> | MPR On / Off |
-| <kbd>A</kbd> | Angle Measurement | <kbd>R</kbd> | Reset View |
-| <kbd>E</kbd> | Elliptical ROI | <kbd>I</kbd> | Invert |
-| <kbd>B</kbd> | Pixel Probe | <kbd>O</kbd> | Rotate 90° |
-| <kbd>T</kbd> | Text Overlay | <kbd>H</kbd> / <kbd>V</kbd> | Flip (Horizontal/Vertical) |
-| <kbd>G</kbd> | DICOM Tags | <kbd>S</kbd> | Save PNG |
-| <kbd>F</kbd> | Full Screen | <kbd>Esc</kbd> | Leave MPR / 3D |
+### Plugin: General
+* Display DICOM TAG - see [tag.js](/bluelight/scripts/plugin/tag.js)
+* Display LUT- see [table.js](/bluelight/scripts/plugin/table.js)
 
-</details>
+## Supported library
+* BlueLight Viewer uses - <a href="https://github.com/cornerstonejs/dicomParser">dicomParser</a> for parsing DICOM tags.
 
----
+# Roadmap
+* FHIR ImagingStudy Query/Retrieve Interface
+* Support the IHE Invoke Image Display (IID) Profile [RAD-106]
+* Display DICOM Structured Report
+* Display DICOM Waveform - 12 Lead ECG Waveform
 
-## 🔌 Free API Integration
+# Special projects
+* **BlueLight-WSI**: :construction: please visit the project [mainecoon](https://github.com/cylab-tw/mainecoon)
+* **BlueLight@Orthanc**: :secret:
+* **BlueLight@XANT**: :white_check_mark:
+* **BlueLight@Raccoon.net**: :white_check_mark: - [Raccoon.net](https://github.com/cylab-tw/raccoon) is a noSQL-based medical image repository.
 
-Integrate SmartViewer into your own websites, clinics, PACS, RIS, or patient portals. Choose the method that best fits your infrastructure.
+# Acknowledgement
+* To acknowledge the BlueLight in an academic publication, please cite
+  - Chen, TT., Sun, YC., Chu, WC. et al. BlueLight: An Open Source DICOM Viewer Using Low-Cost Computation Algorithm Implemented with JavaScript Using Advanced Medical Imaging Visualization. J Digit Imaging 36, 753–763 (2023). https://doi.org/10.1007/s10278-022-00746-0
 
-### Way 1 — Open Image URLs
-Best for a small number of files. Pass each DICOM file as a URL parameter (ensure URLs are URL-encoded).
-```text
-[https://smartjoans.space/dicom/?title=Chest%20X-ray&url=ENCODED_IMAGE_URL_1&url=ENCODED_IMAGE_URL_2](https://smartjoans.space/dicom/?title=Chest%20X-ray&url=ENCODED_IMAGE_URL_1&url=ENCODED_IMAGE_URL_2)
+* Grants from the Ministry of Science and Technology Taiwan supported this project.
+* We acknowledge the AI99 teams at Taipei Veterans General Hospital (TVGH) for validation and provide many useful suggestions in many aspects of the clinical domain, especially to thank Dr. Ying-Chou Sun and his professional team.
+* Thanks [琦雯Queenie](https://www.cakeresume.com/Queenie0814?locale=zh-TW), [Queenie's github](https://github.com/Queenie0814) for contributing the logo design. 
