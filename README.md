@@ -30,7 +30,7 @@ Built for secondary viewing and sharing, the viewer runs entirely in your browse
 - ✅ **Web Control Panels:** Upload and extract directly within your **cPanel**, DirectAdmin, or Plesk file manager.
 - ✅ **Cloud Hosting:** Deploy instantly on any PHP-supported cloud hosting platform.
 
-**How to run:** Just extract the ZIP file into your web directory and navigate to `index.php` in your browser. Your private DICOM viewer is instantly live!
+**How to run:** Just extract the viewer.zip ZIP file into your web directory and navigate to `index.php` in your browser. Your private DICOM viewer is instantly live!
 
 ---
 
